@@ -1,0 +1,19 @@
+{
+    "name": "Gley.TrafficSystem",
+    "rootNamespace": "Gley.TrafficSystem",
+    "references": [
+        "Unity.Mathematics",
+        "Gley.UrbanSystem",
+        "Unity.Burst",
+        "Gley.TrafficSystem.User"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

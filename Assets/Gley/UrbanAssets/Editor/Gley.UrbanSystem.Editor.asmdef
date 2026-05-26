@@ -1,0 +1,19 @@
+{
+    "name": "Gley.UrbanSystem.Editor",
+    "rootNamespace": "Gley.UrbanSystem.Editor",
+    "references": [
+        "Gley.UrbanSystem",
+        "Gley.Common.Editor"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

@@ -1,0 +1,15 @@
+{
+    "name": "com.gley.about",
+    "version": "2.1.5",
+    "displayName": "About Gley",
+    "description": "Information about Gley products.",
+    "unity": "2021.3",
+    "documentationUrl": "",
+    "changelogUrl": "",
+    "author": {
+        "name": "Gley Games",
+        "email": "gleygames@hotmail.com",
+        "url": "https://gleygames.com"
+    },
+    "samples": []
+}

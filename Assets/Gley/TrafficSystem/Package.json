@@ -1,0 +1,21 @@
+{
+    "name": "com.gley.trafficsystem",
+    "version": "3.5.4",
+    "displayName": "Traffic System",
+    "description": "A highly performant and user-friendly traffic system that enhances any driving game in just a few clicks. No coding required—detailed documentation and tutorials are included.",
+    "unity": "2021.3",
+    "documentationUrl": "https://gley.gitbook.io/mobile-traffic-system-v3/",
+    "changelogUrl": "https://gley.gitbook.io/mobile-traffic-system-v3/releases",
+    "author": {
+        "name": "Gley Games",
+        "email": "gleygames@hotmail.com",
+        "url": "https://gleygames.com"
+    },
+    "samples": [
+        {
+            "displayName": "Traffic Example",
+            "description": "A scene with working traffic vehicles.",
+            "path": "Samples~"
+        }
+    ]
+}

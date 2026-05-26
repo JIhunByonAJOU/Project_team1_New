@@ -1,0 +1,15 @@
+{
+    "name": "com.gley.urbanassets",
+    "version": "2.0.2",
+    "displayName": "Urban Assets",
+    "description": "This package is shared between Traffic and Pedestrian package",
+    "unity": "2021.3",
+    "documentationUrl": "",
+    "changelogUrl": "",
+    "author": {
+        "name": "Gley Games",
+        "email": "gleygames@hotmail.com",
+        "url": "https://gleygames.com"
+    },
+    "samples": []
+}
