@@ -1344,7 +1344,18 @@ namespace DRT
                 passengerManager.LogSummary();
             }
 
-            nextStopSelector?.NotifyEpisodeFinished(completedAllRequests);
+            float averageWaitSeconds = passengerManager != null ? passengerManager.GetAverageConfirmedWaitTime() : 0f;
+            float averageRideSeconds = passengerManager != null ? passengerManager.GetAverageCompletedRideTime() : 0f;
+            float serviceRate = passengerManager != null ? passengerManager.GetServiceRate() : 0f;
+            int completedCount = passengerManager != null ? passengerManager.GetCompletedCount() : 0;
+
+            nextStopSelector?.NotifyEpisodeFinished(
+                completedAllRequests,
+                episodeTravelDistanceMeters,
+                averageWaitSeconds,
+                averageRideSeconds,
+                serviceRate,
+                completedCount);
         }
 
         private void OnValidate()
