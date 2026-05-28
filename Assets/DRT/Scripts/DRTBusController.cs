@@ -50,7 +50,10 @@ namespace DRT
         private int currentStopId;
         private int targetStopId;
         private Coroutine dwellRoutine;
+        private Coroutine decisionRoutine;
         private float nextMovementDiagnosticTime;
+        private float currentLegStartEpisodeTime;
+        private float currentLegPlannedDistanceMeters;
 
         public float EpisodeTimeSeconds => episodeTimeSeconds;
         public bool IsInitialized => initialized;
@@ -228,6 +231,8 @@ namespace DRT
             initialized = true;
             currentStopId = 0;
             targetStopId = 0;
+            currentLegStartEpisodeTime = episodeTimeSeconds;
+            currentLegPlannedDistanceMeters = 0f;
             API.DontRemoveVehicle(vehicleIndex, true);
             backgroundTrafficEnabled = backgroundTrafficEnabledOnStart;
             ApplyBackgroundTrafficState();
@@ -312,7 +317,11 @@ namespace DRT
             }
 
             currentStopId = reachedStopId;
-            passengerManager.ProcessStopArrival(currentStopId, episodeTimeSeconds);
+            var stopResult = passengerManager.ProcessStopArrival(currentStopId, episodeTimeSeconds);
+            nextStopSelector.RecordStopArrival(
+                stopResult,
+                episodeTimeSeconds - currentLegStartEpisodeTime,
+                currentLegPlannedDistanceMeters);
 
             if (stopWhenAllRequestsCompleted && !passengerManager.HasUnfinishedRequests(episodeTimeSeconds))
             {
@@ -326,9 +335,19 @@ namespace DRT
 
         private void SendToNextStop()
         {
+            if (decisionRoutine != null)
+            {
+                StopCoroutine(decisionRoutine);
+            }
+
+            decisionRoutine = StartCoroutine(SelectAndSendToNextStop());
+        }
+
+        private IEnumerator SelectAndSendToNextStop()
+        {
             if (episodeFinished)
             {
-                return;
+                yield break;
             }
 
             var vehicle = API.GetVehicleComponent(vehicleIndex);
@@ -336,26 +355,47 @@ namespace DRT
             {
                 driving = false;
                 Debug.LogWarning($"[BUSCONTROLLER] Vehicle {vehicleIndex} is not active. Cannot send it to next stop yet.");
-                return;
+                yield break;
             }
 
-            int nextStopId = nextStopSelector.SelectNextStopId(
-                currentStopId,
-                stops,
-                passengerManager,
-                episodeTimeSeconds);
+            int nextStopId = -1;
+            bool decisionStarted = nextStopSelector.BeginDecision(currentStopId, stops, passengerManager, episodeTimeSeconds);
+            if (decisionStarted)
+            {
+                float waitStartTime = Time.time;
+                while (!episodeFinished && !nextStopSelector.TryConsumeDecision(out nextStopId))
+                {
+                    if (Time.time - waitStartTime >= nextStopSelector.MaxDecisionWaitSeconds)
+                    {
+                        nextStopSelector.CancelDecision();
+                        break;
+                    }
+
+                    yield return null;
+                }
+            }
+
+            if (nextStopId < 1)
+            {
+                nextStopId = nextStopSelector.SelectNextStopId(
+                    currentStopId,
+                    stops,
+                    passengerManager,
+                    episodeTimeSeconds);
+            }
 
             if (!TryGetStop(nextStopId, out DRTStop nextStop))
             {
                 FinishEpisode($"No valid next stop found. Requested Stop={nextStopId}");
-                return;
+                yield break;
             }
 
             ApplyControlledVehicleSettings(vehicle);
 
             Vector3 servicePoint = GetStopServicePoint(nextStop);
             LogRouteDiagnostics(nextStop, servicePoint);
-
+            currentLegStartEpisodeTime = episodeTimeSeconds;
+            currentLegPlannedDistanceMeters = GetPlanarDistance(GetVehicleArrivalPoint(vehicle), servicePoint);
             var path = API.GetPath(vehicle.transform.position, servicePoint, vehicle.VehicleType);
             if (path == null || path.Count == 0)
             {
@@ -364,7 +404,7 @@ namespace DRT
                     $"[BUSCONTROLLER] PathAssignmentSkipped vehicle={vehicleIndex}, candidateStop={nextStop.StopId}, " +
                     $"candidateObject={nextStop.name}. " +
                     "Check that this BusStop is close to a Gley traffic waypoint and allowed for this vehicle type.");
-                return;
+                yield break;
             }
 
             API.SetVehiclePath(vehicleIndex, path);
@@ -691,6 +731,8 @@ namespace DRT
 
             episodeFinished = true;
             driving = false;
+            nextStopSelector?.NotifyEpisodeFinished(
+                passengerManager != null && !passengerManager.HasUnfinishedRequests(episodeTimeSeconds));
 
             Debug.Log($"[BUSCONTROLLER] Episode finished. {reason}");
 
