@@ -1,14 +1,20 @@
 using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using Gley.TrafficSystem;
 using Gley.UrbanSystem;
 using UnityEngine;
 
+#if UNITY_EDITOR
+using UnityEditor;
+#endif
+
 using VehicleTypes = Gley.TrafficSystem.User.VehicleTypes;
 
 namespace DRT
 {
+    [AddComponentMenu("DRT/DRT Bus Controller")]
     public class DRTBusController : MonoBehaviour
     {
         [Header("Scene References")]
@@ -29,6 +35,15 @@ namespace DRT
         [SerializeField] private float controlledVehicleSpeedMultiplier = 1.5f;
         [SerializeField] private float playerWaypointReachDistanceMeters = 6f;
         [SerializeField] private bool autoFollowControlledVehicle = true;
+
+        [Header("Travel Execution")]
+        [SerializeField] private DRTTravelExecutionMode travelExecutionMode = DRTTravelExecutionMode.MatrixTeleportTraining;
+        [SerializeField] private string travelTimeMatrixResourceName = "drt_stop_travel_time_matrix";
+        [SerializeField] private float matrixNominalSpeedMetersPerSecond = 15f;
+        [SerializeField] private bool preferGeneratedMatrixFromGley = true;
+        [SerializeField] private bool autoGenerateMatrixFromGleyWhenMissing = true;
+        [SerializeField] private bool saveGeneratedMatrixAssetInEditor;
+        [SerializeField] private bool logMatrixTravel = true;
 
         [Header("Diagnostics")]
         [SerializeField] private bool logMovementDiagnostics;
@@ -53,6 +68,7 @@ namespace DRT
         [SerializeField] private float fallYThreshold = -10f;
 
         private readonly List<DRTStop> stops = new List<DRTStop>();
+        private readonly DRTStopTravelTimeMatrix travelTimeMatrix = new DRTStopTravelTimeMatrix();
         private DRTPlayerVehicleDriver playerVehicleDriver;
         private float episodeTimeSeconds;
         private bool initialized;
@@ -70,6 +86,7 @@ namespace DRT
         private Vector3 lastVehicleMovementPosition;
         private float lastVehicleMovementRealtime;
         private bool hasVehicleMovementSample;
+        private bool travelTimeMatrixLoadAttempted;
         private int episodeIndex;
 
         public float EpisodeTimeSeconds => episodeTimeSeconds;
@@ -87,6 +104,9 @@ namespace DRT
         public string TargetStopObjectName => TryGetStop(targetStopId, out DRTStop stop) ? stop.name : "-";
         public bool BackgroundTrafficEnabled => backgroundTrafficEnabled;
         public int ActiveBackgroundVehicleCount => CountActiveBackgroundTrafficVehicles();
+        public DRTTravelExecutionMode TravelExecutionMode => travelExecutionMode;
+        public string TravelExecutionModeName => travelExecutionMode.ToString();
+        public bool UsesMatrixTeleportTraining => travelExecutionMode == DRTTravelExecutionMode.MatrixTeleportTraining;
         public IReadOnlyList<DRTStop> Stops => stops;
 
         public void Configure(
@@ -137,10 +157,11 @@ namespace DRT
             driving = false;
             episodeFinished = false;
             waitingForArrivalProximity = false;
-            currentStopId = 0;
+            currentStopId = UsesMatrixTeleportTraining ? startStopId : 0;
             targetStopId = 0;
             nextMovementDiagnosticTime = 0f;
             hasVehicleMovementSample = false;
+            travelTimeMatrixLoadAttempted = false;
             lastVehicleMovementRealtime = Time.realtimeSinceStartup;
             lastVehicleMovementPosition = Vector3.zero;
 
@@ -175,10 +196,17 @@ namespace DRT
                 return;
             }
 
-            episodeTimeSeconds += Time.deltaTime * simulationSecondsPerRealSecond;
+            if (!UsesMatrixTeleportTraining)
+            {
+                episodeTimeSeconds += Time.deltaTime * simulationSecondsPerRealSecond;
+            }
+
             passengerManager?.UpdateRequestStates(episodeTimeSeconds);
             LogMovementDiagnosticsIfNeeded();
-            MonitorVehicleFailureIfNeeded();
+            if (!UsesMatrixTeleportTraining)
+            {
+                MonitorVehicleFailureIfNeeded();
+            }
 
             if (episodeFinished)
             {
@@ -345,13 +373,21 @@ namespace DRT
             }
 
             initialized = true;
-            currentStopId = 0;
+            currentStopId = UsesMatrixTeleportTraining ? startStopId : 0;
             targetStopId = 0;
             EnsureBackgroundTrafficStateInitialized();
             ApplyBackgroundTrafficState();
             ResetControlledVehicleForEpisode();
+            if (UsesMatrixTeleportTraining && !EnsureTravelTimeMatrix())
+            {
+                initialized = false;
+                return;
+            }
+
             ApplyCameraFollow(controlledPlayerVehicle);
-            Debug.Log($"[BUSCONTROLLER] Initialized playerVehicle={ControlledVehicleName}, firstTargetHint={startStopId}");
+            Debug.Log(
+                $"[BUSCONTROLLER] Initialized playerVehicle={ControlledVehicleName}, " +
+                $"mode={TravelExecutionModeName}, firstTargetHint={startStopId}");
             SendToNextStop();
         }
 
@@ -515,13 +551,8 @@ namespace DRT
                 yield break;
             }
 
-            currentStopId = reachedStopId;
-            var stopResult = passengerManager.ProcessStopArrival(currentStopId, episodeTimeSeconds);
-            nextStopSelector.RecordStopArrival(stopResult, episodeTimeSeconds);
-
-            if (stopWhenAllRequestsCompleted && !passengerManager.HasUnfinishedRequests(episodeTimeSeconds))
+            if (ProcessStopArrivalAndMaybeFinish(reachedStopId))
             {
-                FinishEpisode("All passenger requests completed.");
                 yield break;
             }
 
@@ -546,7 +577,11 @@ namespace DRT
                 yield break;
             }
 
-            if (!ResolveControlledPlayerVehicle(true))
+            if (UsesMatrixTeleportTraining)
+            {
+                ResolveControlledPlayerVehicle(false);
+            }
+            else if (!ResolveControlledPlayerVehicle(true))
             {
                 driving = false;
                 yield break;
@@ -584,6 +619,12 @@ namespace DRT
                 yield break;
             }
 
+            if (UsesMatrixTeleportTraining)
+            {
+                yield return ExecuteMatrixTeleportLeg(nextStop);
+                yield break;
+            }
+
             Vector3 servicePoint = GetStopServicePoint(nextStop);
             LogRouteDiagnostics(nextStop, servicePoint);
             var path = API.GetPath(GetControlledVehicleBodyPosition(), servicePoint, controlledVehicleType);
@@ -609,6 +650,89 @@ namespace DRT
             driving = true;
             ResetLegSafetyState(GetControlledVehicleBodyPosition());
             LogPathAssignment(nextStop, servicePoint, path);
+        }
+
+        private IEnumerator ExecuteMatrixTeleportLeg(DRTStop nextStop)
+        {
+            int originStopId = currentStopId > 0 ? currentStopId : startStopId;
+
+            if (!EnsureTravelTimeMatrix() ||
+                !travelTimeMatrix.TryGetTravelTimeSeconds(originStopId, nextStop.StopId, out float travelSeconds))
+            {
+                FinishFailedEpisode($"Travel time matrix lookup failed. from={originStopId}, to={nextStop.StopId}");
+                yield break;
+            }
+
+            targetStopId = nextStop.StopId;
+            driving = false;
+            waitingForArrivalProximity = false;
+
+            episodeTimeSeconds += travelSeconds;
+            passengerManager?.UpdateRequestStates(episodeTimeSeconds);
+            TeleportControlledVehicleToStop(nextStop);
+
+            if (logMatrixTravel)
+            {
+                Debug.Log(
+                    $"[BUSCONTROLLER] MatrixTeleport from={originStopId}, to={nextStop.StopId}, " +
+                    $"travel={travelSeconds:0.00}s, episodeTime={episodeTimeSeconds:0.00}s");
+            }
+
+            if (ProcessStopArrivalAndMaybeFinish(nextStop.StopId))
+            {
+                yield break;
+            }
+
+            yield return null;
+            SendToNextStop();
+        }
+
+        private bool ProcessStopArrivalAndMaybeFinish(int reachedStopId)
+        {
+            currentStopId = reachedStopId;
+
+            if (passengerManager == null || nextStopSelector == null)
+            {
+                FinishEpisode("Passenger manager or next stop selector missing at stop arrival.");
+                return true;
+            }
+
+            var stopResult = passengerManager.ProcessStopArrival(currentStopId, episodeTimeSeconds);
+            nextStopSelector.RecordStopArrival(stopResult, episodeTimeSeconds);
+
+            if (stopWhenAllRequestsCompleted && !passengerManager.HasUnfinishedRequests(episodeTimeSeconds))
+            {
+                FinishEpisode("All passenger requests completed.");
+                return true;
+            }
+
+            if (episodeTimeSeconds >= episodeLengthSeconds && passengerManager.GetOnBoardCount() == 0)
+            {
+                FinishEpisode("Episode time ended.");
+                return true;
+            }
+
+            return false;
+        }
+
+        private void TeleportControlledVehicleToStop(DRTStop stop)
+        {
+            if (stop == null || !ResolveControlledPlayerVehicle(false))
+            {
+                return;
+            }
+
+            Vector3 servicePoint = GetStopServicePoint(stop);
+            Quaternion rotation = controlledPlayerVehicle != null ? controlledPlayerVehicle.rotation : Quaternion.identity;
+            TrafficWaypoint closestWaypoint = API.IsInitialized() ? API.GetClosestWaypoint(servicePoint) : null;
+            if (closestWaypoint != null)
+            {
+                rotation = GetWaypointForwardRotation(closestWaypoint, rotation);
+            }
+
+            playerVehicleDriver.TeleportTo(servicePoint, rotation);
+            ApplyCameraFollow(controlledPlayerVehicle);
+            ResetLegSafetyState(GetControlledVehicleBodyPosition());
         }
 
         private bool TryGetStop(int stopId, out DRTStop stop)
@@ -721,6 +845,147 @@ namespace DRT
             }
 
             return count;
+        }
+
+        public bool TryGetTravelTimeSeconds(int fromStopId, int toStopId, out float seconds)
+        {
+            seconds = 0f;
+            return EnsureTravelTimeMatrix() &&
+                   travelTimeMatrix.TryGetTravelTimeSeconds(fromStopId, toStopId, out seconds);
+        }
+
+        public bool TryGetAverageStopTravelTimeMinutes(IReadOnlyList<DRTStop> selectedStops, out float averageMinutes)
+        {
+            averageMinutes = 0f;
+            return EnsureTravelTimeMatrix() &&
+                   travelTimeMatrix.TryGetAverageTravelTimeMinutes(selectedStops, out averageMinutes);
+        }
+
+        [ContextMenu("Regenerate DRT Stop Travel Time Matrix CSV")]
+        public void RegenerateTravelTimeMatrixCsv()
+        {
+            ResolveReferences();
+            LoadStops(false);
+
+            if (!API.IsInitialized())
+            {
+                Debug.LogWarning("[BUSCONTROLLER] Gley Traffic API is not initialized. Start Play Mode before regenerating the matrix.");
+                return;
+            }
+
+            if (!TryGenerateTravelTimeMatrixFromGley(out string csvText, out string error))
+            {
+                Debug.LogError($"[BUSCONTROLLER] Travel time matrix generation failed. {error}");
+                return;
+            }
+
+            SaveTravelTimeMatrixCsvAsset(csvText, true);
+            travelTimeMatrixLoadAttempted = false;
+            Debug.Log($"[BUSCONTROLLER] Travel time matrix regenerated. stops={travelTimeMatrix.StopCount}");
+        }
+
+        private bool EnsureTravelTimeMatrix()
+        {
+            if (travelTimeMatrix.IsLoaded)
+            {
+                return true;
+            }
+
+            if (stops.Count == 0)
+            {
+                LoadStops(false);
+            }
+
+            if (stops.Count == 0)
+            {
+                return false;
+            }
+
+            if (travelTimeMatrixLoadAttempted)
+            {
+                return false;
+            }
+
+            travelTimeMatrixLoadAttempted = true;
+
+            if (preferGeneratedMatrixFromGley && API.IsInitialized() && autoGenerateMatrixFromGleyWhenMissing)
+            {
+                if (TryGenerateTravelTimeMatrixFromGley(out string generatedCsvFromGley, out string generatedErrorFromGley))
+                {
+                    SaveTravelTimeMatrixCsvAsset(generatedCsvFromGley, false);
+                    Debug.Log(
+                        $"[BUSCONTROLLER] Generated travel time matrix from Gley paths. " +
+                        $"stops={travelTimeMatrix.StopCount}, speed={matrixNominalSpeedMetersPerSecond:0.00}m/s");
+                    return true;
+                }
+
+                Debug.LogWarning($"[BUSCONTROLLER] Preferred Gley travel time matrix generation failed. {generatedErrorFromGley}");
+            }
+
+            TextAsset csvAsset = Resources.Load<TextAsset>(travelTimeMatrixResourceName);
+            string loadError = null;
+            if (csvAsset != null && travelTimeMatrix.LoadFromCsv(csvAsset.text, stops, out loadError))
+            {
+                Debug.Log(
+                    $"[BUSCONTROLLER] Loaded travel time matrix resource={travelTimeMatrixResourceName}, " +
+                    $"stops={travelTimeMatrix.StopCount}");
+                return true;
+            }
+
+            if (csvAsset != null)
+            {
+                Debug.LogWarning($"[BUSCONTROLLER] Travel time matrix CSV invalid. {loadError}");
+            }
+
+            if (!autoGenerateMatrixFromGleyWhenMissing)
+            {
+                Debug.LogError($"[BUSCONTROLLER] Travel time matrix unavailable. resource={travelTimeMatrixResourceName}");
+                return false;
+            }
+
+            if (!TryGenerateTravelTimeMatrixFromGley(out string generatedCsv, out string generationError))
+            {
+                Debug.LogError($"[BUSCONTROLLER] Travel time matrix auto-generation failed. {generationError}");
+                return false;
+            }
+
+            SaveTravelTimeMatrixCsvAsset(generatedCsv, false);
+            Debug.Log(
+                $"[BUSCONTROLLER] Generated travel time matrix from Gley paths. " +
+                $"stops={travelTimeMatrix.StopCount}, speed={matrixNominalSpeedMetersPerSecond:0.00}m/s");
+            return true;
+        }
+
+        private bool TryGenerateTravelTimeMatrixFromGley(out string csvText, out string error)
+        {
+            return travelTimeMatrix.GenerateFromGleyPaths(
+                stops,
+                GetStopServicePoint,
+                controlledVehicleType,
+                matrixNominalSpeedMetersPerSecond,
+                out csvText,
+                out error);
+        }
+
+        private void SaveTravelTimeMatrixCsvAsset(string csvText, bool force)
+        {
+#if UNITY_EDITOR
+            if (!force && !saveGeneratedMatrixAssetInEditor)
+            {
+                return;
+            }
+
+            string resourcesPath = System.IO.Path.Combine(Application.dataPath, "DRT", "Resources");
+            Directory.CreateDirectory(resourcesPath);
+
+            string fileName = string.IsNullOrWhiteSpace(travelTimeMatrixResourceName)
+                ? "drt_stop_travel_time_matrix"
+                : travelTimeMatrixResourceName;
+            string csvPath = System.IO.Path.Combine(resourcesPath, fileName + ".csv");
+            File.WriteAllText(csvPath, csvText);
+            AssetDatabase.Refresh();
+            Debug.Log($"[BUSCONTROLLER] Saved travel time matrix CSV to {csvPath}");
+#endif
         }
 
         private void LogRouteDiagnostics(DRTStop stop, Vector3 servicePoint)
@@ -1039,6 +1304,7 @@ namespace DRT
             arrivalWaitTimeoutSeconds = Mathf.Max(0.5f, arrivalWaitTimeoutSeconds);
             controlledVehicleSpeedMultiplier = Mathf.Max(0.1f, controlledVehicleSpeedMultiplier);
             playerWaypointReachDistanceMeters = Mathf.Max(0.5f, playerWaypointReachDistanceMeters);
+            matrixNominalSpeedMetersPerSecond = Mathf.Max(0.1f, matrixNominalSpeedMetersPerSecond);
             enabledTrafficDensity = Mathf.Max(1, enabledTrafficDensity);
             episodeLengthSeconds = Mathf.Max(1f, episodeLengthSeconds);
             simulationSecondsPerRealSecond = Mathf.Max(0.01f, simulationSecondsPerRealSecond);

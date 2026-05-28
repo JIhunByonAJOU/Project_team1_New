@@ -21,6 +21,7 @@ namespace DRT
         [SerializeField] private bool skipCurrentStop = true;
         [SerializeField] private float episodeLengthSeconds = 3600f;
         [SerializeField] private float maxDistanceForObservation = 500f;
+        [SerializeField] private float maxTravelSecondsForObservation = 1800f;
         [SerializeField] private float maxWaitSecondsForObservation = 1800f;
         [SerializeField] private float maxDecisionWaitSeconds = 1f;
 
@@ -226,9 +227,9 @@ namespace DRT
                     ? decisionPassengerManager.GetScheduledCountAtStop(stop.StopId, decisionEpisodeTime)
                     : 0;
 
-                float distance = valid && currentStop != null
-                    ? Vector3.Distance(currentStop.Position, stop.Position)
-                    : maxDistanceForObservation;
+                float travelFeature = valid && currentStop != null
+                    ? GetCandidateTravelFeature(currentStop.StopId, stop.StopId, currentStop, stop)
+                    : 1f;
 
                 GetStopPassengerTimeFeatures(
                     valid ? stop.StopId : -1,
@@ -238,7 +239,7 @@ namespace DRT
 
                 sensor.AddObservation(valid ? 1f : 0f);
                 sensor.AddObservation(isCurrent ? 1f : 0f);
-                sensor.AddObservation(Mathf.Clamp01(distance / Mathf.Max(1f, maxDistanceForObservation)));
+                sensor.AddObservation(travelFeature);
                 sensor.AddObservation(Mathf.Clamp01((float)waitingAtStop / capacity));
                 sensor.AddObservation(Mathf.Clamp01((float)dropOffAtStop / capacity));
                 sensor.AddObservation(Mathf.Clamp01((float)scheduledAtStop / capacity));
@@ -342,7 +343,7 @@ namespace DRT
                 float distancePenalty = 0f;
                 if (currentStop != null)
                 {
-                    distancePenalty = Vector3.Distance(currentStop.Position, stop.Position) * distancePenaltyWeight;
+                    distancePenalty = GetTravelPenaltyUnits(currentStop.StopId, stop.StopId, currentStop, stop) * distancePenaltyWeight;
                 }
 
                 float score =
@@ -540,6 +541,12 @@ namespace DRT
                 return minimumNetworkAverageReward;
             }
 
+            if (busController != null &&
+                busController.TryGetAverageStopTravelTimeMinutes(decisionStops, out float matrixAverageMinutes))
+            {
+                return Mathf.Max(minimumNetworkAverageReward, matrixAverageMinutes);
+            }
+
             float totalMinutes = 0f;
             int pairCount = 0;
 
@@ -581,6 +588,39 @@ namespace DRT
         private static float SecondsToMinutes(float seconds)
         {
             return Mathf.Max(0f, seconds) / 60f;
+        }
+
+        private float GetCandidateTravelFeature(int fromStopId, int toStopId, DRTStop origin, DRTStop destination)
+        {
+            if (busController != null &&
+                busController.TryGetTravelTimeSeconds(fromStopId, toStopId, out float matrixSeconds))
+            {
+                return Mathf.Clamp01(matrixSeconds / Mathf.Max(1f, maxTravelSecondsForObservation));
+            }
+
+            if (origin == null || destination == null)
+            {
+                return 1f;
+            }
+
+            float distance = Vector3.Distance(origin.Position, destination.Position);
+            return Mathf.Clamp01(distance / Mathf.Max(1f, maxDistanceForObservation));
+        }
+
+        private float GetTravelPenaltyUnits(int fromStopId, int toStopId, DRTStop origin, DRTStop destination)
+        {
+            if (busController != null &&
+                busController.TryGetTravelTimeSeconds(fromStopId, toStopId, out float matrixSeconds))
+            {
+                return matrixSeconds;
+            }
+
+            if (origin == null || destination == null)
+            {
+                return 0f;
+            }
+
+            return Vector3.Distance(origin.Position, destination.Position);
         }
 
         private void GetStopPassengerTimeFeatures(int stopId, float currentEpisodeTime, out float maxWaitSeconds, out float maxRideSeconds)
@@ -714,6 +754,7 @@ namespace DRT
             maxStops = Mathf.Max(2, maxStops);
             episodeLengthSeconds = Mathf.Max(1f, episodeLengthSeconds);
             maxDistanceForObservation = Mathf.Max(1f, maxDistanceForObservation);
+            maxTravelSecondsForObservation = Mathf.Max(1f, maxTravelSecondsForObservation);
             maxWaitSecondsForObservation = Mathf.Max(1f, maxWaitSecondsForObservation);
             maxDecisionWaitSeconds = Mathf.Max(0.05f, maxDecisionWaitSeconds);
             unboardedPassengerPenaltyWeight = Mathf.Max(0f, unboardedPassengerPenaltyWeight);
