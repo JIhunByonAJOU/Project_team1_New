@@ -78,7 +78,10 @@ namespace DRT
             }
 
             HasGenerated = true;
-            Debug.Log($"[DRT] Demand generated. Requests={passengerManager.Requests.Count}");
+            Debug.Log(
+                $"[DEMANDGENERATOR] Generated requests={passengerManager.Requests.Count}, " +
+                $"stopCount={stopCount}, scheduleEntries={sourceSchedule.Count}, " +
+                $"firstRequest={FormatFirstRequest()}");
         }
 
         private List<DRTDemandScheduleEntry> BuildDefaultRuleBasedSchedule()
@@ -118,13 +121,13 @@ namespace DRT
 
             if (entry.originStopId == entry.destinationStopId)
             {
-                Debug.LogWarning($"[DRT] Demand ignored. Origin and destination are both Stop {entry.originStopId}.");
+                Debug.LogWarning($"[DEMANDGENERATOR] Demand ignored. Origin and destination are both Stop {entry.originStopId}.");
                 return false;
             }
 
             if (entry.originStopId < 1 || entry.destinationStopId < 1)
             {
-                Debug.LogWarning("[DRT] Demand ignored. Stop IDs must start at 1.");
+                Debug.LogWarning("[DEMANDGENERATOR] Demand ignored. Stop IDs must start at 1.");
                 return false;
             }
 
@@ -134,6 +137,17 @@ namespace DRT
             }
 
             return true;
+        }
+
+        private string FormatFirstRequest()
+        {
+            if (passengerManager == null || passengerManager.Requests.Count == 0)
+            {
+                return "-";
+            }
+
+            var request = passengerManager.Requests[0];
+            return $"#{request.PassengerId}:{request.OriginStopId}->{request.DestinationStopId}@{request.RequestTimeSeconds:0}s";
         }
 
         private void OnValidate()

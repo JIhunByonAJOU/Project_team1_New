@@ -16,9 +16,19 @@ namespace DRT
         private Vector2 overviewScroll;
         private Rect passengerWindow = new Rect(12, 12, 850, 360);
         private Rect overviewWindow = new Rect(12, 384, 520, 420);
+        private Rect controlWindow = new Rect(12, 812, 260, 130);
+        private int resizingWindowId = -1;
+        private int pendingResizeWindowId = -1;
+        private Vector2 pendingResizeWindowSize;
         private GUIStyle headerStyle;
         private GUIStyle smallStyle;
         private GUIStyle cellStyle;
+        private GUIStyle resizeStyle;
+
+        private const int PassengerWindowId = 5201;
+        private const int OverviewWindowId = 5202;
+        private const int ControlWindowId = 5203;
+        private const float ResizeHandleSize = 18f;
 
         public void Configure(DRTPassengerManager newPassengerManager, DRTBusController newBusController)
         {
@@ -42,16 +52,23 @@ namespace DRT
         private void OnGUI()
         {
             EnsureStyles();
+            ClampWindowToScreen(ref passengerWindow);
+            ClampWindowToScreen(ref overviewWindow);
+            ClampWindowToScreen(ref controlWindow);
 
             if (showPassengerTable)
             {
-                passengerWindow = GUI.Window(5201, passengerWindow, DrawPassengerWindow, "DRT Passenger Requests");
+                passengerWindow = GUI.Window(PassengerWindowId, passengerWindow, DrawPassengerWindow, "DRT Passenger Requests");
+                ApplyPendingResize(ref passengerWindow, PassengerWindowId);
             }
 
             if (showStopOverview)
             {
-                overviewWindow = GUI.Window(5202, overviewWindow, DrawOverviewWindow, "DRT Stop / Bus Status");
+                overviewWindow = GUI.Window(OverviewWindowId, overviewWindow, DrawOverviewWindow, "DRT Stop / Bus Status");
+                ApplyPendingResize(ref overviewWindow, OverviewWindowId);
             }
+
+            controlWindow = GUI.Window(ControlWindowId, controlWindow, DrawControlWindow, "DRT GUI");
         }
 
         private void DrawPassengerWindow(int windowId)
@@ -68,7 +85,7 @@ namespace DRT
             GUILayout.Space(4);
 
             DrawCsvHeader();
-            passengerScroll = GUILayout.BeginScrollView(passengerScroll, GUILayout.Height(285));
+            passengerScroll = GUILayout.BeginScrollView(passengerScroll, GUILayout.Height(Mathf.Max(120f, passengerWindow.height - 76f)));
 
             int rows = 0;
             foreach (var request in passengerManager.Requests.OrderBy(request => request.PassengerId))
@@ -84,7 +101,8 @@ namespace DRT
             }
 
             GUILayout.EndScrollView();
-            GUI.DragWindow();
+            DrawResizeHandle(ref passengerWindow, windowId, 520f, 210f);
+            GUI.DragWindow(new Rect(0f, 0f, passengerWindow.width - ResizeHandleSize, 24f));
         }
 
         private void DrawOverviewWindow(int windowId)
@@ -97,13 +115,19 @@ namespace DRT
             }
 
             float currentTime = busController.EpisodeTimeSeconds;
-            GUILayout.Label($"Vehicle {busController.VehicleIndex} | current stop {busController.CurrentStopId} | target stop {busController.TargetStopId}", headerStyle);
-            GUILayout.Label($"initialized={busController.IsInitialized}, driving={busController.IsDriving}, finished={busController.IsEpisodeFinished}", smallStyle);
-            GUILayout.Label($"speed={busController.VehicleSpeedMS:0.00}m/s, targetDist={FormatDistance(busController.TargetDistanceMeters)}, arrival<= {busController.ArrivalDistanceMeters:0.00}m, waiting1m={busController.IsWaitingForArrivalProximity}", smallStyle);
+            GUILayout.Label($"Target Station: Stop {busController.TargetStopId} ({busController.TargetStopObjectName})", headerStyle);
+            GUILayout.Label($"Route: Stop {busController.CurrentStopId} -> Stop {busController.TargetStopId}", smallStyle);
+            GUILayout.Label($"Vehicle {busController.VehicleIndex} | last served stop {busController.CurrentStopId}", smallStyle);
+            GUILayout.Label($"speed={busController.VehicleSpeedMS:0.00}m/s, targetDist={FormatDistance(busController.TargetDistanceMeters)}, arrival<= {busController.ArrivalDistanceMeters:0.00}m, waitingArrival={busController.IsWaitingForArrivalProximity}", smallStyle);
+            GUILayout.Label($"traffic={(busController.BackgroundTrafficEnabled ? "on" : "off")}, activeOtherVehicles={busController.ActiveBackgroundVehicleCount}", smallStyle);
             GUILayout.Space(6);
 
-            overviewScroll = GUILayout.BeginScrollView(overviewScroll, GUILayout.Height(320));
-            GUILayout.Label("Stops", headerStyle);
+            overviewScroll = GUILayout.BeginScrollView(overviewScroll, GUILayout.Height(Mathf.Max(150f, overviewWindow.height - 122f)));
+            GUILayout.Label($"In Vehicle ({passengerManager.GetOnBoardCount()})", headerStyle);
+            DrawRouteOnlyList(passengerManager.Requests.Where(request => request.Status == DRTPassengerStatus.OnBoard));
+
+            GUILayout.Space(8);
+            GUILayout.Label("Waiting At Stops", headerStyle);
 
             foreach (var stop in busController.Stops)
             {
@@ -112,22 +136,47 @@ namespace DRT
                     continue;
                 }
 
-                int waiting = passengerManager.GetWaitingCountAtStop(stop.StopId, currentTime);
-                int scheduled = passengerManager.GetScheduledCountAtStop(stop.StopId, currentTime);
-                int dropOff = passengerManager.GetOnBoardDestinationCount(stop.StopId);
-                GUILayout.Label($"Stop {stop.StopId}: waiting {waiting}, future {scheduled}, onboard-to-here {dropOff}", cellStyle);
+                var waitingRequests = passengerManager.Requests
+                    .Where(request => request.OriginStopId == stop.StopId && request.Status == DRTPassengerStatus.Waiting)
+                    .OrderBy(request => request.RequestTimeSeconds)
+                    .ToList();
+
+                string routes = waitingRequests.Count > 0
+                    ? string.Join(", ", waitingRequests.Select(FormatRouteOnly))
+                    : "-";
+                GUILayout.Label($"Stop {stop.StopId}: {routes}", cellStyle);
             }
 
-            GUILayout.Space(8);
-            GUILayout.Label("On Board", headerStyle);
-            DrawRequestList(passengerManager.Requests.Where(request => request.Status == DRTPassengerStatus.OnBoard), currentTime);
-
-            GUILayout.Space(8);
-            GUILayout.Label("Waiting", headerStyle);
-            DrawRequestList(passengerManager.Requests.Where(request => request.Status == DRTPassengerStatus.Waiting), currentTime);
-
             GUILayout.EndScrollView();
-            GUI.DragWindow();
+            DrawResizeHandle(ref overviewWindow, windowId, 360f, 250f);
+            GUI.DragWindow(new Rect(0f, 0f, overviewWindow.width - ResizeHandleSize, 24f));
+        }
+
+        private void DrawControlWindow(int windowId)
+        {
+            GUILayout.BeginHorizontal();
+            showPassengerTable = GUILayout.Toggle(showPassengerTable, "Passenger Table", GUILayout.Width(130));
+            showStopOverview = GUILayout.Toggle(showStopOverview, "Bus Status", GUILayout.Width(100));
+            GUILayout.EndHorizontal();
+
+            if (busController != null)
+            {
+                GUILayout.Space(4);
+                GUILayout.Label($"traffic={(busController.BackgroundTrafficEnabled ? "on" : "off")}, activeOtherVehicles={busController.ActiveBackgroundVehicleCount}", smallStyle);
+                GUILayout.BeginHorizontal();
+                if (GUILayout.Button("Traffic On", GUILayout.Width(100)))
+                {
+                    busController.EnableBackgroundTraffic();
+                }
+
+                if (GUILayout.Button("Traffic Off", GUILayout.Width(100)))
+                {
+                    busController.DisableBackgroundTraffic();
+                }
+                GUILayout.EndHorizontal();
+            }
+
+            GUI.DragWindow(new Rect(0f, 0f, controlWindow.width, 24f));
         }
 
         private void DrawCsvHeader()
@@ -182,9 +231,82 @@ namespace DRT
             }
         }
 
+        private void DrawRouteOnlyList(IEnumerable<DRTPassengerRequest> requests)
+        {
+            var routeTexts = requests
+                .OrderBy(request => request.PickupTimeSeconds)
+                .Select(FormatRouteOnly)
+                .ToList();
+
+            if (routeTexts.Count == 0)
+            {
+                GUILayout.Label("-", smallStyle);
+                return;
+            }
+
+            GUILayout.Label(string.Join(", ", routeTexts), cellStyle);
+        }
+
+        private string FormatRouteOnly(DRTPassengerRequest request)
+        {
+            return $"{request.OriginStopId}->{request.DestinationStopId}";
+        }
+
         private void DrawCell(string value, float width, bool header = false)
         {
             GUILayout.Label(value, header ? headerStyle : cellStyle, GUILayout.Width(width));
+        }
+
+        private void DrawResizeHandle(ref Rect windowRect, int windowId, float minWidth, float minHeight)
+        {
+            Rect handleRect = new Rect(windowRect.width - ResizeHandleSize, windowRect.height - ResizeHandleSize, ResizeHandleSize, ResizeHandleSize);
+            GUI.Box(handleRect, "R", resizeStyle);
+
+            Event currentEvent = Event.current;
+            if (currentEvent.type == EventType.MouseDown && handleRect.Contains(currentEvent.mousePosition))
+            {
+                resizingWindowId = windowId;
+                currentEvent.Use();
+            }
+
+            if (resizingWindowId == windowId && currentEvent.type == EventType.MouseDrag)
+            {
+                windowRect.width = Mathf.Max(minWidth, currentEvent.mousePosition.x + ResizeHandleSize * 0.5f);
+                windowRect.height = Mathf.Max(minHeight, currentEvent.mousePosition.y + ResizeHandleSize * 0.5f);
+                pendingResizeWindowId = windowId;
+                pendingResizeWindowSize = new Vector2(windowRect.width, windowRect.height);
+                currentEvent.Use();
+            }
+
+            if (resizingWindowId == windowId && currentEvent.type == EventType.MouseUp)
+            {
+                resizingWindowId = -1;
+                currentEvent.Use();
+            }
+        }
+
+        private void ApplyPendingResize(ref Rect windowRect, int windowId)
+        {
+            if (pendingResizeWindowId != windowId)
+            {
+                return;
+            }
+
+            windowRect.width = pendingResizeWindowSize.x;
+            windowRect.height = pendingResizeWindowSize.y;
+
+            if (Event.current.type == EventType.MouseUp)
+            {
+                pendingResizeWindowId = -1;
+            }
+        }
+
+        private void ClampWindowToScreen(ref Rect windowRect)
+        {
+            float maxX = Mathf.Max(0f, Screen.width - Mathf.Min(windowRect.width, Screen.width));
+            float maxY = Mathf.Max(0f, Screen.height - Mathf.Min(windowRect.height, Screen.height));
+            windowRect.x = Mathf.Clamp(windowRect.x, -windowRect.width + 80f, maxX);
+            windowRect.y = Mathf.Clamp(windowRect.y, 0f, maxY);
         }
 
         private string FormatTime(float value)
@@ -221,6 +343,13 @@ namespace DRT
             {
                 fontSize = 12,
                 normal = { textColor = Color.white }
+            };
+
+            resizeStyle = new GUIStyle(GUI.skin.box)
+            {
+                fontSize = 8,
+                alignment = TextAnchor.MiddleCenter,
+                normal = { textColor = new Color(0.86f, 0.9f, 0.94f) }
             };
         }
     }
