@@ -74,13 +74,13 @@ namespace DRT
         {
             UpdateRequestStates(currentEpisodeTime);
 
-            int droppedOffCount = DropOffPassengers(stopId, currentEpisodeTime);
-            int boardedCount = BoardPassengers(stopId, currentEpisodeTime);
+            List<DRTPassengerRequest> droppedOffPassengers = DropOffPassengers(stopId, currentEpisodeTime);
+            List<DRTPassengerRequest> boardedPassengers = BoardPassengers(stopId, currentEpisodeTime);
 
             var result = new DRTStopProcessResult(
                 stopId,
-                boardedCount,
-                droppedOffCount,
+                boardedPassengers.Count,
+                droppedOffPassengers.Count,
                 GetWaitingCount(currentEpisodeTime),
                 GetOnBoardCount(),
                 GetCompletedCount());
@@ -88,9 +88,11 @@ namespace DRT
             if (logStopProcessing)
             {
                 Debug.Log(
-                    $"[DRT] Stop {stopId} arrived. " +
+                    $"[PASSENGERMANAGER] StopArrival stop={stopId} t={currentEpisodeTime:0.0}s " +
                     $"Boarded={result.BoardedCount}, DroppedOff={result.DroppedOffCount}, " +
-                    $"Waiting={result.WaitingCount}, OnBoard={result.OnBoardCount}, Completed={result.CompletedCount}");
+                    $"Waiting={result.WaitingCount}, OnBoard={result.OnBoardCount}, Completed={result.CompletedCount}, " +
+                    $"boardedPassengers=[{FormatPassengerRoutes(boardedPassengers)}], " +
+                    $"droppedPassengers=[{FormatPassengerRoutes(droppedOffPassengers)}]");
             }
 
             return result;
@@ -209,30 +211,30 @@ namespace DRT
                 $"AvgRide={GetAverageCompletedRideTime():0.0}s");
         }
 
-        private int DropOffPassengers(int stopId, float currentEpisodeTime)
+        private List<DRTPassengerRequest> DropOffPassengers(int stopId, float currentEpisodeTime)
         {
-            int droppedOffCount = 0;
+            var droppedOffPassengers = new List<DRTPassengerRequest>();
 
             for (int i = 0; i < requests.Count; i++)
             {
                 if (requests[i].CanDropOffAtStop(stopId))
                 {
                     requests[i].MarkDroppedOff(currentEpisodeTime, stopId);
-                    droppedOffCount++;
+                    droppedOffPassengers.Add(requests[i]);
                 }
             }
 
-            return droppedOffCount;
+            return droppedOffPassengers;
         }
 
-        private int BoardPassengers(int stopId, float currentEpisodeTime)
+        private List<DRTPassengerRequest> BoardPassengers(int stopId, float currentEpisodeTime)
         {
             int freeSeats = Mathf.Max(0, busCapacity - GetOnBoardCount());
-            int boardedCount = 0;
+            var boardedPassengers = new List<DRTPassengerRequest>();
 
             if (freeSeats == 0)
             {
-                return 0;
+                return boardedPassengers;
             }
 
             var candidates = requests
@@ -240,13 +242,22 @@ namespace DRT
                 .OrderBy(request => request.RequestTimeSeconds)
                 .ToList();
 
-            for (int i = 0; i < candidates.Count && boardedCount < freeSeats; i++)
+            for (int i = 0; i < candidates.Count && boardedPassengers.Count < freeSeats; i++)
             {
                 candidates[i].MarkBoarded(currentEpisodeTime, stopId);
-                boardedCount++;
+                boardedPassengers.Add(candidates[i]);
             }
 
-            return boardedCount;
+            return boardedPassengers;
+        }
+
+        private static string FormatPassengerRoutes(IEnumerable<DRTPassengerRequest> passengerRequests)
+        {
+            var routes = passengerRequests
+                .Select(request => $"#{request.PassengerId}:{request.OriginStopId}->{request.DestinationStopId}")
+                .ToList();
+
+            return routes.Count > 0 ? string.Join(", ", routes) : "-";
         }
 
         private void OnValidate()

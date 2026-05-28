@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Text;
 using UnityEngine;
 
 namespace DRT
@@ -10,6 +11,7 @@ namespace DRT
         [SerializeField] private float scheduledPassengerWeight = 0.5f;
         [SerializeField] private float distancePenaltyWeight = 0.002f;
         [SerializeField] private bool skipCurrentStop = true;
+        [SerializeField] private bool logDecision = true;
 
         public int SelectNextStopId(
             int currentStopId,
@@ -25,6 +27,7 @@ namespace DRT
             DRTStop currentStop = FindStop(stops, currentStopId);
             int bestStopId = -1;
             float bestScore = float.NegativeInfinity;
+            var scoreSummary = new StringBuilder();
 
             for (int i = 0; i < stops.Count; i++)
             {
@@ -55,6 +58,19 @@ namespace DRT
                     scheduledCount * scheduledPassengerWeight -
                     distancePenalty;
 
+                if (scoreSummary.Length > 0)
+                {
+                    scoreSummary.Append("; ");
+                }
+
+                scoreSummary.Append("S")
+                    .Append(stop.StopId)
+                    .Append("(w=").Append(waitingCount)
+                    .Append(",drop=").Append(dropOffCount)
+                    .Append(",future=").Append(scheduledCount)
+                    .Append(",score=").Append(score.ToString("0.00"))
+                    .Append(")");
+
                 if (score > bestScore)
                 {
                     bestScore = score;
@@ -64,15 +80,43 @@ namespace DRT
 
             if (bestStopId >= 1 && bestScore > 0f)
             {
+                LogSelectedStop("weighted-score", bestStopId, currentStopId, currentEpisodeTime, passengerManager, bestScore, scoreSummary.ToString());
                 return bestStopId;
             }
 
             if (passengerManager.TryGetNextScheduledOrigin(currentEpisodeTime, out int scheduledOriginStopId))
             {
+                LogSelectedStop("next-scheduled-origin", scheduledOriginStopId, currentStopId, currentEpisodeTime, passengerManager, bestScore, scoreSummary.ToString());
                 return scheduledOriginStopId;
             }
 
-            return GetNextSequentialStopId(currentStopId, stops);
+            int sequentialStopId = GetNextSequentialStopId(currentStopId, stops);
+            LogSelectedStop("sequential-fallback", sequentialStopId, currentStopId, currentEpisodeTime, passengerManager, bestScore, scoreSummary.ToString());
+            return sequentialStopId;
+        }
+
+        private void LogSelectedStop(
+            string reason,
+            int selectedStopId,
+            int currentStopId,
+            float currentEpisodeTime,
+            DRTPassengerManager passengerManager,
+            float bestScore,
+            string scoreSummary)
+        {
+            if (!logDecision)
+            {
+                return;
+            }
+
+            int waiting = passengerManager.GetWaitingCountAtStop(selectedStopId, currentEpisodeTime);
+            int dropOff = passengerManager.GetOnBoardDestinationCount(selectedStopId);
+            int scheduled = passengerManager.GetScheduledCountAtStop(selectedStopId, currentEpisodeTime);
+
+            Debug.Log(
+                $"[NEXTSTOPSELECTOR] t={currentEpisodeTime:0.0}s current={currentStopId} selected={selectedStopId} " +
+                $"reason={reason} selectedDemand(wait={waiting},drop={dropOff},future={scheduled}) " +
+                $"bestScore={bestScore:0.00} scores=[{scoreSummary}]");
         }
 
         private static DRTStop FindStop(IReadOnlyList<DRTStop> stops, int stopId)

@@ -19,14 +19,19 @@ namespace DRT
         [SerializeField] private int vehicleIndex = 0;
         [SerializeField] private int startStopId = 1;
         [SerializeField] private float dwellSeconds = 5f;
-        [SerializeField] private float arrivalDistanceMeters = 1f;
-        [SerializeField] private float stopWaypointSnapDistanceMeters = 1f;
+        [SerializeField] private float arrivalDistanceMeters = 5f;
+        [SerializeField] private float stopWaypointSnapDistanceMeters = 5f;
         [SerializeField] private float arrivalWaitTimeoutSeconds = 12f;
+        [SerializeField] private float controlledVehicleSpeedMultiplier = 1.5f;
         [SerializeField] private bool autoFollowControlledVehicle = true;
 
         [Header("Diagnostics")]
-        [SerializeField] private bool logMovementDiagnostics = true;
+        [SerializeField] private bool logMovementDiagnostics;
         [SerializeField] private float movementDiagnosticsIntervalSeconds = 2f;
+
+        [Header("Background Traffic")]
+        [SerializeField] private bool backgroundTrafficEnabledOnStart = true;
+        [SerializeField] private int enabledTrafficDensity = 30;
 
         [Header("Episode")]
         [SerializeField] private float episodeLengthSeconds = 3600f;
@@ -41,6 +46,7 @@ namespace DRT
         private bool episodeFinished;
         private bool waitingForArrivalProximity;
         private bool cameraFollowApplied;
+        private bool backgroundTrafficEnabled;
         private int currentStopId;
         private int targetStopId;
         private Coroutine dwellRoutine;
@@ -57,6 +63,9 @@ namespace DRT
         public float ArrivalDistanceMeters => arrivalDistanceMeters;
         public float VehicleSpeedMS => GetVehicleSpeedMS();
         public float TargetDistanceMeters => GetTargetDistanceMeters();
+        public string TargetStopObjectName => TryGetStop(targetStopId, out DRTStop stop) ? stop.name : "-";
+        public bool BackgroundTrafficEnabled => backgroundTrafficEnabled;
+        public int ActiveBackgroundVehicleCount => CountActiveBackgroundTrafficVehicles();
         public IReadOnlyList<DRTStop> Stops => stops;
 
         public void Configure(
@@ -149,6 +158,14 @@ namespace DRT
                 if (stop == null)
                 {
                     stop = child.gameObject.AddComponent<DRTStop>();
+                }
+
+                if (TryParseStopIdFromName(child.name, out int parsedStopId))
+                {
+                    stop.SetStopId(parsedStopId);
+                }
+                else if (stop.StopId < 1)
+                {
                     stop.SetStopId(i + 1);
                 }
 
@@ -168,7 +185,8 @@ namespace DRT
                 Debug.LogWarning($"[DRT] Duplicate stop IDs detected: {string.Join(", ", duplicateIds)}");
             }
 
-            Debug.Log($"[DRT] Loaded {stops.Count} stops from {busStopsRoot.name}.");
+            Debug.Log($"[BUSCONTROLLER] Loaded stops count={stops.Count}, root={busStopsRoot.name}");
+            LogStopMap();
         }
 
         private void ResolveReferences()
@@ -211,9 +229,33 @@ namespace DRT
             currentStopId = 0;
             targetStopId = 0;
             API.DontRemoveVehicle(vehicleIndex, true);
+            backgroundTrafficEnabled = backgroundTrafficEnabledOnStart;
+            ApplyBackgroundTrafficState();
+            ApplyControlledVehicleSettings(vehicle);
             ApplyCameraFollow(vehicle);
-            Debug.Log($"[DRT] Bus controller initialized. Vehicle={vehicleIndex}, FirstTargetHint={startStopId}");
+            Debug.Log($"[BUSCONTROLLER] Initialized vehicle={vehicleIndex}, firstTargetHint={startStopId}, vehicleName={vehicle.name}");
             SendToNextStop();
+        }
+
+        public void EnableBackgroundTraffic()
+        {
+            SetBackgroundTrafficEnabled(true);
+        }
+
+        public void DisableBackgroundTraffic()
+        {
+            SetBackgroundTrafficEnabled(false);
+        }
+
+        public void ToggleBackgroundTraffic()
+        {
+            SetBackgroundTrafficEnabled(!backgroundTrafficEnabled);
+        }
+
+        public void SetBackgroundTrafficEnabled(bool enabled)
+        {
+            backgroundTrafficEnabled = enabled;
+            ApplyBackgroundTrafficState();
         }
 
         private void DestinationReachedHandler(int reachedVehicleIndex)
@@ -249,7 +291,7 @@ namespace DRT
                 if (Time.time - waitStartTime >= arrivalWaitTimeoutSeconds)
                 {
                     Debug.LogWarning(
-                        $"[DRT] Vehicle {vehicleIndex} reached Gley destination for Stop {reachedStopId}, " +
+                        $"[BUSCONTROLLER] Vehicle {vehicleIndex} reached Gley destination for Stop {reachedStopId}, " +
                         $"but vehicle-stop distance is {FormatMeters(distance)} > {arrivalDistanceMeters:0.00}m. " +
                         "Boarding/dropoff skipped. Move the BusStop closer to the road waypoint or increase the arrival threshold.");
                     waitingForArrivalProximity = false;
@@ -293,7 +335,7 @@ namespace DRT
             if (vehicle == null || !vehicle.gameObject.activeSelf)
             {
                 driving = false;
-                Debug.LogWarning($"[DRT] Vehicle {vehicleIndex} is not active. Cannot send it to next stop yet.");
+                Debug.LogWarning($"[BUSCONTROLLER] Vehicle {vehicleIndex} is not active. Cannot send it to next stop yet.");
                 return;
             }
 
@@ -309,24 +351,26 @@ namespace DRT
                 return;
             }
 
-            targetStopId = nextStop.StopId;
-            driving = true;
-            LogRouteDiagnostics(nextStop);
+            ApplyControlledVehicleSettings(vehicle);
 
             Vector3 servicePoint = GetStopServicePoint(nextStop);
+            LogRouteDiagnostics(nextStop, servicePoint);
+
             var path = API.GetPath(vehicle.transform.position, servicePoint, vehicle.VehicleType);
             if (path == null || path.Count == 0)
             {
                 driving = false;
                 Debug.LogWarning(
-                    $"[DRT] No drivable path for Vehicle {vehicleIndex} -> Stop {targetStopId}. " +
+                    $"[BUSCONTROLLER] PathAssignmentSkipped vehicle={vehicleIndex}, candidateStop={nextStop.StopId}, " +
+                    $"candidateObject={nextStop.name}. " +
                     "Check that this BusStop is close to a Gley traffic waypoint and allowed for this vehicle type.");
                 return;
             }
 
             API.SetVehiclePath(vehicleIndex, path);
-
-            Debug.Log($"[DRT] Vehicle {vehicleIndex} -> Stop {targetStopId} at t={episodeTimeSeconds:0.0}s, pathWaypoints={path.Count}");
+            targetStopId = nextStop.StopId;
+            driving = true;
+            LogPathAssignment(vehicle, nextStop, servicePoint, path);
         }
 
         private bool TryGetStop(int stopId, out DRTStop stop)
@@ -370,13 +414,91 @@ namespace DRT
             cameraFollowApplied = true;
         }
 
-        private void LogRouteDiagnostics(DRTStop stop)
+        private void ApplyControlledVehicleSettings(VehicleComponent vehicle)
         {
-            if (!logMovementDiagnostics)
+            if (vehicle == null || vehicle.MovementInfo == null)
             {
                 return;
             }
 
+            float multiplier = Mathf.Max(0.1f, controlledVehicleSpeedMultiplier);
+            float exactReductionPercent = 1f - multiplier;
+            float exactIncreasePercent = multiplier - 1f;
+            vehicle.MovementInfo.SetSpeedVariationPercent(exactReductionPercent, exactIncreasePercent);
+        }
+
+        private void ApplyBackgroundTrafficState()
+        {
+            if (!API.IsInitialized())
+            {
+                return;
+            }
+
+            if (backgroundTrafficEnabled)
+            {
+                API.SetTrafficDensity(enabledTrafficDensity);
+                Debug.Log($"[BUSCONTROLLER] Background traffic enabled. density={enabledTrafficDensity}");
+                return;
+            }
+
+            API.SetTrafficDensity(0);
+            int removedCount = RemoveBackgroundTrafficVehicles();
+            Debug.Log($"[BUSCONTROLLER] Background traffic disabled. removed={removedCount}, busVehicle={vehicleIndex}");
+        }
+
+        private int RemoveBackgroundTrafficVehicles()
+        {
+            var vehicles = API.GetAllVehicles();
+            if (vehicles == null)
+            {
+                return 0;
+            }
+
+            int removedCount = 0;
+            for (int i = 0; i < vehicles.Length; i++)
+            {
+                if (i == vehicleIndex)
+                {
+                    continue;
+                }
+
+                if (vehicles[i] != null && vehicles[i].gameObject.activeSelf)
+                {
+                    API.RemoveVehicle(i);
+                    removedCount++;
+                }
+            }
+
+            return removedCount;
+        }
+
+        private int CountActiveBackgroundTrafficVehicles()
+        {
+            if (!API.IsInitialized())
+            {
+                return 0;
+            }
+
+            var vehicles = API.GetAllVehicles();
+            if (vehicles == null)
+            {
+                return 0;
+            }
+
+            int count = 0;
+            for (int i = 0; i < vehicles.Length; i++)
+            {
+                if (i != vehicleIndex && vehicles[i] != null && vehicles[i].gameObject.activeSelf)
+                {
+                    count++;
+                }
+            }
+
+            return count;
+        }
+
+        private void LogRouteDiagnostics(DRTStop stop, Vector3 servicePoint)
+        {
             var vehicle = API.GetVehicleComponent(vehicleIndex);
             if (vehicle == null || stop == null)
             {
@@ -387,7 +509,6 @@ namespace DRT
             float stopToWaypointDistance = closestStopWaypoint != null
                 ? GetPlanarDistance(stop.Position, closestStopWaypoint.Position)
                 : float.PositiveInfinity;
-            Vector3 servicePoint = GetStopServicePoint(stop);
             float frontToStopDistance = GetPlanarDistance(GetVehicleArrivalPoint(vehicle), stop.Position);
             float frontToServiceDistance = GetPlanarDistance(GetVehicleArrivalPoint(vehicle), servicePoint);
 
@@ -396,11 +517,56 @@ namespace DRT
                 : -1;
 
             Debug.Log(
-                $"[DRT] Route request. vehicle={vehicleIndex}, currentWaypoint={currentWaypoint}, " +
-                $"targetStop={stop.StopId}, frontToService={FormatMeters(frontToServiceDistance)}, " +
+                $"[BUSCONTROLLER] RouteRequest vehicle={vehicleIndex}, currentWaypoint={currentWaypoint}, " +
+                $"targetStop={stop.StopId}, targetObject={stop.name}, frontToService={FormatMeters(frontToServiceDistance)}, " +
                 $"frontToStopMarker={FormatMeters(frontToStopDistance)}, " +
+                $"servicePoint={FormatVector(servicePoint)}, stopMarker={FormatVector(stop.Position)}, " +
                 $"rootToStop={FormatMeters(GetPlanarDistance(vehicle.transform.position, stop.Position))}, " +
                 $"stopToClosestWaypoint={FormatMeters(stopToWaypointDistance)}");
+        }
+
+        private void LogPathAssignment(VehicleComponent vehicle, DRTStop targetStop, Vector3 servicePoint, List<int> path)
+        {
+            string endpointDescription = DescribePathEndpoint(path, servicePoint, out float endToServiceDistance);
+            float warningDistance = Mathf.Max(15f, arrivalDistanceMeters + stopWaypointSnapDistanceMeters);
+            string integrity = endToServiceDistance <= warningDistance ? "ok" : "warning";
+
+            string message =
+                $"[BUSCONTROLLER] PathAssigned integrity={integrity}, vehicle={vehicleIndex}, " +
+                $"targetStop={targetStop.StopId}, targetObject={targetStop.name}, pathWaypoints={path.Count}, " +
+                $"servicePoint={FormatVector(servicePoint)}, {endpointDescription}";
+
+            if (integrity == "warning")
+            {
+                Debug.LogWarning(message);
+            }
+            else
+            {
+                Debug.Log(message);
+            }
+        }
+
+        private string DescribePathEndpoint(List<int> path, Vector3 servicePoint, out float endToServiceDistance)
+        {
+            endToServiceDistance = float.PositiveInfinity;
+
+            if (path == null || path.Count == 0)
+            {
+                return "pathEndpoint=none";
+            }
+
+            int firstWaypointIndex = path[0];
+            int lastWaypointIndex = path[path.Count - 1];
+            var lastWaypoint = API.GetWaypointFromIndex(lastWaypointIndex);
+            if (lastWaypoint == null)
+            {
+                return $"firstWaypoint={firstWaypointIndex}, lastWaypoint={lastWaypointIndex}, endpointPosition=unknown, endToService=n/a";
+            }
+
+            endToServiceDistance = GetPlanarDistance(lastWaypoint.Position, servicePoint);
+            return
+                $"firstWaypoint={firstWaypointIndex}, lastWaypoint={lastWaypointIndex}, " +
+                $"endpointPosition={FormatVector(lastWaypoint.Position)}, endToService={FormatMeters(endToServiceDistance)}";
         }
 
         private void LogMovementDiagnosticsIfNeeded()
@@ -417,20 +583,25 @@ namespace DRT
                 return;
             }
 
+            if (!API.IsInitialized())
+            {
+                return;
+            }
+
             var vehicle = API.GetVehicleComponent(vehicleIndex);
             if (vehicle == null)
             {
-                Debug.LogWarning($"[DRT] Vehicle {vehicleIndex} not found while monitoring movement.");
+                Debug.LogWarning($"[BUSCONTROLLER] Vehicle {vehicleIndex} not found while monitoring movement.");
                 return;
             }
 
             var movement = vehicle.MovementInfo;
             int customPathCount = movement?.CustomPath != null ? movement.CustomPath.Count : 0;
             Debug.Log(
-                $"[DRT] Move status. vehicle={vehicleIndex}, targetStop={targetStopId}, " +
+                $"[BUSCONTROLLER] MoveStatus vehicle={vehicleIndex}, targetStop={targetStopId}, " +
                 $"distance={FormatMeters(GetTargetDistanceMeters())}, speed={vehicle.GetCurrentSpeedMS():0.00}m/s, " +
                 $"hasPath={movement?.HasPath}, pathLength={movement?.PathLength}, remaining={movement?.RemainingPathLength}, " +
-                $"customPath={customPathCount}, waitingFor1m={waitingForArrivalProximity}");
+                $"customPath={customPathCount}, waitingForArrival={waitingForArrivalProximity}");
         }
 
         private float GetVehicleSpeedMS()
@@ -521,7 +692,7 @@ namespace DRT
             episodeFinished = true;
             driving = false;
 
-            Debug.Log($"[DRT] Episode finished. {reason}");
+            Debug.Log($"[BUSCONTROLLER] Episode finished. {reason}");
 
             if (logEpisodeSummary && passengerManager != null)
             {
@@ -537,9 +708,58 @@ namespace DRT
             arrivalDistanceMeters = Mathf.Max(0.05f, arrivalDistanceMeters);
             stopWaypointSnapDistanceMeters = Mathf.Max(0.05f, stopWaypointSnapDistanceMeters);
             arrivalWaitTimeoutSeconds = Mathf.Max(0.5f, arrivalWaitTimeoutSeconds);
+            controlledVehicleSpeedMultiplier = Mathf.Max(0.1f, controlledVehicleSpeedMultiplier);
+            enabledTrafficDensity = Mathf.Max(1, enabledTrafficDensity);
             episodeLengthSeconds = Mathf.Max(1f, episodeLengthSeconds);
             simulationSecondsPerRealSecond = Mathf.Max(0.01f, simulationSecondsPerRealSecond);
             movementDiagnosticsIntervalSeconds = Mathf.Max(0.25f, movementDiagnosticsIntervalSeconds);
+        }
+
+        private void LogStopMap()
+        {
+            if (stops.Count == 0)
+            {
+                return;
+            }
+
+            string stopMap = string.Join(
+                "; ",
+                stops.Select(stop => $"S{stop.StopId}={stop.name}@{FormatVector(stop.Position)}"));
+            Debug.Log($"[BUSCONTROLLER] StopMap {stopMap}");
+        }
+
+        private static bool TryParseStopIdFromName(string objectName, out int stopId)
+        {
+            stopId = -1;
+            if (string.IsNullOrEmpty(objectName))
+            {
+                return false;
+            }
+
+            int end = objectName.Length - 1;
+            while (end >= 0 && !char.IsDigit(objectName[end]))
+            {
+                end--;
+            }
+
+            if (end < 0)
+            {
+                return false;
+            }
+
+            int start = end;
+            while (start >= 0 && char.IsDigit(objectName[start]))
+            {
+                start--;
+            }
+
+            string numberText = objectName.Substring(start + 1, end - start);
+            return int.TryParse(numberText, out stopId) && stopId >= 1;
+        }
+
+        private static string FormatVector(Vector3 value)
+        {
+            return $"({value.x:0.00},{value.y:0.00},{value.z:0.00})";
         }
     }
 }
