@@ -158,7 +158,7 @@ namespace DRT
             RecordStat("DRT/StopArrivals", 1f, StatAggregationMethod.Sum);
             RecordStat("DRT/EpisodeStopArrivalCount", episodeStopArrivalCount, StatAggregationMethod.MostRecent);
 
-            if (logReward)
+            if (logReward && !ShouldSuppressUnityLogs())
             {
                 Debug.Log(
                     $"[NEXTSTOPSELECTOR] PaperReward stop={result.StopId} t={currentEpisodeTime:0.0}s " +
@@ -179,7 +179,7 @@ namespace DRT
             RecordStat("DRT/Reward/ExternalPenalty", penalty);
             RecordStat("DRT/Reward/EpisodeTotal", episodeRewardTotal, StatAggregationMethod.MostRecent);
 
-            if (logReward)
+            if (logReward && !ShouldSuppressUnityLogs())
             {
                 Debug.Log($"[NEXTSTOPSELECTOR] ExternalPenalty reward={penalty:0.000}, reason={reason}");
             }
@@ -398,7 +398,7 @@ namespace DRT
             float bestScore,
             string scoreSummary)
         {
-            if (!logDecision)
+            if (!logDecision || ShouldSuppressUnityLogs())
             {
                 return;
             }
@@ -685,6 +685,11 @@ namespace DRT
             StatAggregationMethod aggregationMethod = StatAggregationMethod.Average)
         {
             Academy.Instance.StatsRecorder.Add(name, value, aggregationMethod);
+        }
+
+        private bool ShouldSuppressUnityLogs()
+        {
+            return busController != null && busController.SuppressUnityLogsDuringMatrixTraining;
         }
 
         private void ResolveBusController()

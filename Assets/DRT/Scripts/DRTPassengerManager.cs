@@ -70,7 +70,7 @@ namespace DRT
             }
         }
 
-        public DRTStopProcessResult ProcessStopArrival(int stopId, float currentEpisodeTime)
+        public DRTStopProcessResult ProcessStopArrival(int stopId, float currentEpisodeTime, bool suppressLog = false)
         {
             UpdateRequestStates(currentEpisodeTime);
 
@@ -85,7 +85,7 @@ namespace DRT
                 GetOnBoardCount(),
                 GetCompletedCount());
 
-            if (logStopProcessing)
+            if (logStopProcessing && !suppressLog)
             {
                 Debug.Log(
                     $"[PASSENGERMANAGER] StopArrival stop={stopId} t={currentEpisodeTime:0.0}s " +

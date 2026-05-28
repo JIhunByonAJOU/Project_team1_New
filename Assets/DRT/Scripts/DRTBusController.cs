@@ -44,6 +44,7 @@ namespace DRT
         [SerializeField] private bool autoGenerateMatrixFromGleyWhenMissing = true;
         [SerializeField] private bool saveGeneratedMatrixAssetInEditor;
         [SerializeField] private bool logMatrixTravel = true;
+        [SerializeField] private bool suppressUnityLogsDuringMatrixTraining = true;
 
         [Header("Diagnostics")]
         [SerializeField] private bool logMovementDiagnostics;
@@ -107,6 +108,7 @@ namespace DRT
         public DRTTravelExecutionMode TravelExecutionMode => travelExecutionMode;
         public string TravelExecutionModeName => travelExecutionMode.ToString();
         public bool UsesMatrixTeleportTraining => travelExecutionMode == DRTTravelExecutionMode.MatrixTeleportTraining;
+        public bool SuppressUnityLogsDuringMatrixTraining => UsesMatrixTeleportTraining && suppressUnityLogsDuringMatrixTraining;
         public IReadOnlyList<DRTStop> Stops => stops;
 
         public void Configure(
@@ -170,7 +172,7 @@ namespace DRT
                 demandGenerator.Configure(passengerManager, stops.Count);
             }
 
-            demandGenerator?.ResetDemand();
+            demandGenerator?.ResetDemand(SuppressUnityLogsDuringMatrixTraining);
 
             if (API.IsInitialized())
             {
@@ -180,7 +182,7 @@ namespace DRT
             }
 
             int requestCount = passengerManager != null ? passengerManager.Requests.Count : 0;
-            Debug.Log($"[BUSCONTROLLER] Episode reset. index={episodeIndex}, requests={requestCount}, startStop={startStopId}");
+            LogInfo($"[BUSCONTROLLER] Episode reset. index={episodeIndex}, requests={requestCount}, startStop={startStopId}");
         }
 
         private void Update()
@@ -385,7 +387,7 @@ namespace DRT
             }
 
             ApplyCameraFollow(controlledPlayerVehicle);
-            Debug.Log(
+            LogInfo(
                 $"[BUSCONTROLLER] Initialized playerVehicle={ControlledVehicleName}, " +
                 $"mode={TravelExecutionModeName}, firstTargetHint={startStopId}");
             SendToNextStop();
@@ -671,7 +673,7 @@ namespace DRT
             passengerManager?.UpdateRequestStates(episodeTimeSeconds);
             TeleportControlledVehicleToStop(nextStop);
 
-            if (logMatrixTravel)
+            if (logMatrixTravel && !SuppressUnityLogsDuringMatrixTraining)
             {
                 Debug.Log(
                     $"[BUSCONTROLLER] MatrixTeleport from={originStopId}, to={nextStop.StopId}, " +
@@ -697,7 +699,10 @@ namespace DRT
                 return true;
             }
 
-            var stopResult = passengerManager.ProcessStopArrival(currentStopId, episodeTimeSeconds);
+            var stopResult = passengerManager.ProcessStopArrival(
+                currentStopId,
+                episodeTimeSeconds,
+                SuppressUnityLogsDuringMatrixTraining);
             nextStopSelector.RecordStopArrival(stopResult, episodeTimeSeconds);
 
             if (stopWhenAllRequestsCompleted && !passengerManager.HasUnfinishedRequests(episodeTimeSeconds))
@@ -792,13 +797,13 @@ namespace DRT
             if (backgroundTrafficEnabled)
             {
                 API.SetTrafficDensity(enabledTrafficDensity);
-                Debug.Log($"[BUSCONTROLLER] Background traffic enabled. density={enabledTrafficDensity}");
+                LogInfo($"[BUSCONTROLLER] Background traffic enabled. density={enabledTrafficDensity}");
                 return;
             }
 
             API.SetTrafficDensity(0);
             int removedCount = RemoveBackgroundTrafficVehicles();
-            Debug.Log($"[BUSCONTROLLER] Background traffic disabled. removed={removedCount}");
+            LogInfo($"[BUSCONTROLLER] Background traffic disabled. removed={removedCount}");
         }
 
         private int RemoveBackgroundTrafficVehicles()
@@ -913,7 +918,7 @@ namespace DRT
                 if (TryGenerateTravelTimeMatrixFromGley(out string generatedCsvFromGley, out string generatedErrorFromGley))
                 {
                     SaveTravelTimeMatrixCsvAsset(generatedCsvFromGley, false);
-                    Debug.Log(
+                    LogInfo(
                         $"[BUSCONTROLLER] Generated travel time matrix from Gley paths. " +
                         $"stops={travelTimeMatrix.StopCount}, speed={matrixNominalSpeedMetersPerSecond:0.00}m/s");
                     return true;
@@ -926,7 +931,7 @@ namespace DRT
             string loadError = null;
             if (csvAsset != null && travelTimeMatrix.LoadFromCsv(csvAsset.text, stops, out loadError))
             {
-                Debug.Log(
+                LogInfo(
                     $"[BUSCONTROLLER] Loaded travel time matrix resource={travelTimeMatrixResourceName}, " +
                     $"stops={travelTimeMatrix.StopCount}");
                 return true;
@@ -950,7 +955,7 @@ namespace DRT
             }
 
             SaveTravelTimeMatrixCsvAsset(generatedCsv, false);
-            Debug.Log(
+            LogInfo(
                 $"[BUSCONTROLLER] Generated travel time matrix from Gley paths. " +
                 $"stops={travelTimeMatrix.StopCount}, speed={matrixNominalSpeedMetersPerSecond:0.00}m/s");
             return true;
@@ -1260,6 +1265,16 @@ namespace DRT
             return float.IsInfinity(value) ? "n/a" : $"{value:0.00}m";
         }
 
+        private void LogInfo(string message)
+        {
+            if (SuppressUnityLogsDuringMatrixTraining)
+            {
+                return;
+            }
+
+            Debug.Log(message);
+        }
+
         private void FinishFailedEpisode(string reason)
         {
             if (!Mathf.Approximately(failurePenalty, 0f))
@@ -1284,9 +1299,9 @@ namespace DRT
             waitingForArrivalProximity = false;
             playerVehicleDriver?.StopAndHold(true);
 
-            Debug.Log($"[BUSCONTROLLER] Episode finished. {reason}");
+            LogInfo($"[BUSCONTROLLER] Episode finished. {reason}");
 
-            if (logEpisodeSummary && passengerManager != null)
+            if (logEpisodeSummary && passengerManager != null && !SuppressUnityLogsDuringMatrixTraining)
             {
                 passengerManager.LogSummary();
             }

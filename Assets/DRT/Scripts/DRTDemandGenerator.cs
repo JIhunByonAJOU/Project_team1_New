@@ -42,6 +42,11 @@ namespace DRT
         [ContextMenu("Generate DRT Demand")]
         public void GenerateDemand()
         {
+            GenerateDemand(false);
+        }
+
+        public void GenerateDemand(bool suppressLog)
+        {
             if (passengerManager == null)
             {
                 passengerManager = FindObjectOfType<DRTPassengerManager>();
@@ -78,16 +83,24 @@ namespace DRT
             }
 
             HasGenerated = true;
-            Debug.Log(
-                $"[DEMANDGENERATOR] Generated requests={passengerManager.Requests.Count}, " +
-                $"stopCount={stopCount}, scheduleEntries={sourceSchedule.Count}, " +
-                $"firstRequest={FormatFirstRequest()}");
+            if (!suppressLog)
+            {
+                Debug.Log(
+                    $"[DEMANDGENERATOR] Generated requests={passengerManager.Requests.Count}, " +
+                    $"stopCount={stopCount}, scheduleEntries={sourceSchedule.Count}, " +
+                    $"firstRequest={FormatFirstRequest()}");
+            }
         }
 
         public void ResetDemand()
         {
+            ResetDemand(false);
+        }
+
+        public void ResetDemand(bool suppressLog)
+        {
             HasGenerated = false;
-            GenerateDemand();
+            GenerateDemand(suppressLog);
         }
 
         private List<DRTDemandScheduleEntry> BuildDefaultRuleBasedSchedule()
