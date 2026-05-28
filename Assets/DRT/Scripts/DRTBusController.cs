@@ -52,8 +52,6 @@ namespace DRT
         private Coroutine dwellRoutine;
         private Coroutine decisionRoutine;
         private float nextMovementDiagnosticTime;
-        private float currentLegStartEpisodeTime;
-        private float currentLegPlannedDistanceMeters;
 
         public float EpisodeTimeSeconds => episodeTimeSeconds;
         public bool IsInitialized => initialized;
@@ -231,8 +229,6 @@ namespace DRT
             initialized = true;
             currentStopId = 0;
             targetStopId = 0;
-            currentLegStartEpisodeTime = episodeTimeSeconds;
-            currentLegPlannedDistanceMeters = 0f;
             API.DontRemoveVehicle(vehicleIndex, true);
             backgroundTrafficEnabled = backgroundTrafficEnabledOnStart;
             ApplyBackgroundTrafficState();
@@ -318,10 +314,7 @@ namespace DRT
 
             currentStopId = reachedStopId;
             var stopResult = passengerManager.ProcessStopArrival(currentStopId, episodeTimeSeconds);
-            nextStopSelector.RecordStopArrival(
-                stopResult,
-                episodeTimeSeconds - currentLegStartEpisodeTime,
-                currentLegPlannedDistanceMeters);
+            nextStopSelector.RecordStopArrival(stopResult, episodeTimeSeconds);
 
             if (stopWhenAllRequestsCompleted && !passengerManager.HasUnfinishedRequests(episodeTimeSeconds))
             {
@@ -394,8 +387,6 @@ namespace DRT
 
             Vector3 servicePoint = GetStopServicePoint(nextStop);
             LogRouteDiagnostics(nextStop, servicePoint);
-            currentLegStartEpisodeTime = episodeTimeSeconds;
-            currentLegPlannedDistanceMeters = GetPlanarDistance(GetVehicleArrivalPoint(vehicle), servicePoint);
             var path = API.GetPath(vehicle.transform.position, servicePoint, vehicle.VehicleType);
             if (path == null || path.Count == 0)
             {
