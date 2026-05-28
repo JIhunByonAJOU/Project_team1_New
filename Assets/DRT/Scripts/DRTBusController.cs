@@ -4,6 +4,8 @@ using System.IO;
 using System.Linq;
 using Gley.TrafficSystem;
 using Gley.UrbanSystem;
+using Unity.Barracuda;
+using Unity.MLAgents.Policies;
 using UnityEngine;
 
 #if UNITY_EDITOR
@@ -35,8 +37,11 @@ namespace DRT
         [SerializeField] private float controlledVehicleSpeedMultiplier = 1.5f;
         [SerializeField] private float playerWaypointReachDistanceMeters = 6f;
         [SerializeField] private bool autoFollowControlledVehicle = true;
+        [SerializeField] private bool useGleyVehicleControlInPhysicalDrive = true;
 
-        [Header("Travel Execution")]
+        [Header("Run Mode")]
+        [Tooltip("MatrixTeleportTraining is for fast PPO training. PhysicalDrive is for ONNX inference/demo with the configured vehicle driver.")]
+        [InspectorName("Run Mode (Training / Inference)")]
         [SerializeField] private DRTTravelExecutionMode travelExecutionMode = DRTTravelExecutionMode.MatrixTeleportTraining;
         [SerializeField] private string travelTimeMatrixResourceName = "drt_stop_travel_time_matrix";
         [SerializeField] private float matrixNominalSpeedMetersPerSecond = 15f;
@@ -45,6 +50,11 @@ namespace DRT
         [SerializeField] private bool saveGeneratedMatrixAssetInEditor;
         [SerializeField] private bool logMatrixTravel = true;
         [SerializeField] private bool suppressUnityLogsDuringMatrixTraining = true;
+
+        [Header("Physical Drive Inference")]
+        [Tooltip("Optional ONNX/NNModel asset used when Run Mode is PhysicalDrive. Import the .onnx under Assets first, then assign it here.")]
+        [SerializeField] private NNModel physicalDriveInferenceModel;
+        [SerializeField] private InferenceDevice physicalDriveInferenceDevice = InferenceDevice.Default;
 
         [Header("Diagnostics")]
         [SerializeField] private bool logMovementDiagnostics;
@@ -70,7 +80,9 @@ namespace DRT
 
         private readonly List<DRTStop> stops = new List<DRTStop>();
         private readonly DRTStopTravelTimeMatrix travelTimeMatrix = new DRTStopTravelTimeMatrix();
+        private IDRTVehicleDriver vehicleDriver;
         private DRTPlayerVehicleDriver playerVehicleDriver;
+        private DRTGleyVehicleDriver gleyVehicleDriver;
         private float episodeTimeSeconds;
         private bool initialized;
         private bool driving;
@@ -101,7 +113,7 @@ namespace DRT
         public int CurrentStopId => currentStopId;
         public int TargetStopId => targetStopId;
         public int VehicleIndex => vehicleIndex;
-        public string ControlledVehicleName => controlledPlayerVehicle != null ? controlledPlayerVehicle.name : "-";
+        public string ControlledVehicleName => vehicleDriver != null ? vehicleDriver.VehicleName : controlledPlayerVehicle != null ? controlledPlayerVehicle.name : "-";
         public float ArrivalDistanceMeters => arrivalDistanceMeters;
         public float VehicleSpeedMS => GetVehicleSpeedMS();
         public float TargetDistanceMeters => GetTargetDistanceMeters();
@@ -112,6 +124,7 @@ namespace DRT
         public DRTTravelExecutionMode TravelExecutionMode => travelExecutionMode;
         public string TravelExecutionModeName => travelExecutionMode.ToString();
         public bool UsesMatrixTeleportTraining => travelExecutionMode == DRTTravelExecutionMode.MatrixTeleportTraining;
+        public bool UsesGleyVehicleControl => travelExecutionMode == DRTTravelExecutionMode.PhysicalDrive && useGleyVehicleControlInPhysicalDrive;
         public bool SuppressUnityLogsDuringMatrixTraining => UsesMatrixTeleportTraining && suppressUnityLogsDuringMatrixTraining;
         public IReadOnlyList<DRTStop> Stops => stops;
 
@@ -131,7 +144,7 @@ namespace DRT
             startStopId = Mathf.Max(1, newStartStopId);
             LoadStops();
             WireNextStopSelector();
-            ResolveControlledPlayerVehicle(false);
+            ResolveControlledVehicle(false);
         }
 
         private void Awake()
@@ -139,7 +152,7 @@ namespace DRT
             ResolveReferences();
             LoadStops(false);
             WireNextStopSelector();
-            ResolveControlledPlayerVehicle(false);
+            ResolveControlledVehicle(false);
         }
 
         private void Start()
@@ -163,7 +176,7 @@ namespace DRT
             driving = false;
             episodeFinished = false;
             waitingForArrivalProximity = false;
-            currentStopId = UsesMatrixTeleportTraining ? startStopId : 0;
+            currentStopId = startStopId;
             targetStopId = 0;
             nextMovementDiagnosticTime = 0f;
             hasVehicleMovementSample = false;
@@ -209,6 +222,7 @@ namespace DRT
                 episodeTimeSeconds += Time.deltaTime * simulationSecondsPerRealSecond;
             }
 
+            AdvanceDemandToCurrentTime();
             passengerManager?.UpdateRequestStates(episodeTimeSeconds);
             TrackPhysicalTravelDistanceIfNeeded();
             LogMovementDiagnosticsIfNeeded();
@@ -230,7 +244,7 @@ namespace DRT
 
         private void OnDisable()
         {
-            playerVehicleDriver?.ReleaseControl();
+            vehicleDriver?.ReleaseControl();
         }
 
         [ContextMenu("Reload Stops")]
@@ -316,7 +330,77 @@ namespace DRT
             if (nextStopSelector != null)
             {
                 nextStopSelector.Configure(this);
+                ApplyPhysicalDriveInferencePolicy();
             }
+        }
+
+        private void ApplyPhysicalDriveInferencePolicy()
+        {
+            if (nextStopSelector == null)
+            {
+                return;
+            }
+
+            var behaviorParameters = nextStopSelector.GetComponent<BehaviorParameters>();
+            if (behaviorParameters == null)
+            {
+                return;
+            }
+
+            if (travelExecutionMode == DRTTravelExecutionMode.PhysicalDrive && physicalDriveInferenceModel != null)
+            {
+                behaviorParameters.Model = physicalDriveInferenceModel;
+                behaviorParameters.InferenceDevice = physicalDriveInferenceDevice;
+            }
+
+            if (travelExecutionMode == DRTTravelExecutionMode.PhysicalDrive && behaviorParameters.Model != null)
+            {
+                behaviorParameters.BehaviorType = BehaviorType.InferenceOnly;
+
+                return;
+            }
+
+            if (travelExecutionMode == DRTTravelExecutionMode.MatrixTeleportTraining)
+            {
+                behaviorParameters.BehaviorType = BehaviorType.Default;
+            }
+        }
+
+        private bool ResolveControlledVehicle(bool logIfMissing)
+        {
+            if (UsesGleyVehicleControl)
+            {
+                return ResolveControlledGleyVehicle(logIfMissing);
+            }
+
+            return ResolveControlledPlayerVehicle(logIfMissing);
+        }
+
+        private bool ResolveControlledGleyVehicle(bool logIfMissing)
+        {
+            if (gleyVehicleDriver == null)
+            {
+                gleyVehicleDriver = GetComponent<DRTGleyVehicleDriver>();
+                if (gleyVehicleDriver == null)
+                {
+                    gleyVehicleDriver = gameObject.AddComponent<DRTGleyVehicleDriver>();
+                }
+            }
+
+            gleyVehicleDriver.Configure(vehicleIndex, controlledVehicleType);
+            if (gleyVehicleDriver.VehicleTransform == null)
+            {
+                if (logIfMissing)
+                {
+                    Debug.LogWarning($"[BUSCONTROLLER] Gley controlled vehicle not found. vehicleIndex={vehicleIndex}");
+                }
+
+                return false;
+            }
+
+            vehicleDriver = gleyVehicleDriver;
+            controlledPlayerVehicle = gleyVehicleDriver.VehicleTransform;
+            return true;
         }
 
         private bool ResolveControlledPlayerVehicle(bool logIfMissing)
@@ -361,7 +445,18 @@ namespace DRT
                 playerWaypointReachDistanceMeters,
                 arrivalDistanceMeters);
 
+            vehicleDriver = playerVehicleDriver;
             return true;
+        }
+
+        private Transform GetControlledVehicleTransform()
+        {
+            if (vehicleDriver != null && vehicleDriver.VehicleTransform != null)
+            {
+                return vehicleDriver.VehicleTransform;
+            }
+
+            return controlledPlayerVehicle;
         }
 
         private void TryInitializeDriving()
@@ -376,13 +471,13 @@ namespace DRT
                 return;
             }
 
-            if (!ResolveControlledPlayerVehicle(true))
+            if (!ResolveControlledVehicle(true))
             {
                 return;
             }
 
             initialized = true;
-            currentStopId = UsesMatrixTeleportTraining ? startStopId : 0;
+            currentStopId = startStopId;
             targetStopId = 0;
             EnsureBackgroundTrafficStateInitialized();
             ApplyBackgroundTrafficState();
@@ -394,7 +489,7 @@ namespace DRT
                 return;
             }
 
-            ApplyCameraFollow(controlledPlayerVehicle);
+            ApplyCameraFollow(GetControlledVehicleTransform());
             LogInfo(
                 $"[BUSCONTROLLER] Initialized playerVehicle={ControlledVehicleName}, " +
                 $"mode={TravelExecutionModeName}, firstTargetHint={startStopId}");
@@ -426,7 +521,7 @@ namespace DRT
         private void BeginDwellAtTarget()
         {
             driving = false;
-            playerVehicleDriver?.StopAndHold(true);
+            vehicleDriver?.StopAndHold(true);
 
             if (dwellRoutine != null)
             {
@@ -451,27 +546,29 @@ namespace DRT
             }
 
             nextStopSelector?.CancelDecision();
-            playerVehicleDriver?.StopAndHold(false);
+            vehicleDriver?.StopAndHold(false);
         }
 
         private void ResetControlledVehicleForEpisode()
         {
-            if (!ResolveControlledPlayerVehicle(true))
+            if (!ResolveControlledVehicle(true))
             {
                 return;
             }
 
             if (TryGetStartWaypoint(out TrafficWaypoint startWaypoint))
             {
-                Quaternion rotation = GetWaypointForwardRotation(startWaypoint, controlledPlayerVehicle.rotation);
-                playerVehicleDriver.TeleportTo(startWaypoint.Position, rotation);
-                ApplyCameraFollow(controlledPlayerVehicle);
+                Transform controlledTransform = GetControlledVehicleTransform();
+                Quaternion fallbackRotation = controlledTransform != null ? controlledTransform.rotation : transform.rotation;
+                Quaternion rotation = GetWaypointForwardRotation(startWaypoint, fallbackRotation);
+                vehicleDriver.TeleportTo(startWaypoint.Position, rotation, startWaypoint.ListIndex);
+                ApplyCameraFollow(GetControlledVehicleTransform());
                 ResetLegSafetyState(GetControlledVehicleBodyPosition());
                 return;
             }
 
-            playerVehicleDriver.StopAndHold(true);
-            ApplyCameraFollow(controlledPlayerVehicle);
+            vehicleDriver.StopAndHold(true);
+            ApplyCameraFollow(GetControlledVehicleTransform());
             ResetLegSafetyState(GetControlledVehicleBodyPosition());
         }
 
@@ -589,13 +686,16 @@ namespace DRT
 
             if (UsesMatrixTeleportTraining)
             {
-                ResolveControlledPlayerVehicle(false);
+                ResolveControlledVehicle(false);
             }
-            else if (!ResolveControlledPlayerVehicle(true))
+            else if (!ResolveControlledVehicle(true))
             {
                 driving = false;
                 yield break;
             }
+
+            AdvanceDemandToCurrentTime();
+            passengerManager?.UpdateRequestStates(episodeTimeSeconds);
 
             int nextStopId = -1;
             bool decisionStarted = nextStopSelector.BeginDecision(currentStopId, stops, passengerManager, episodeTimeSeconds);
@@ -623,6 +723,15 @@ namespace DRT
                     episodeTimeSeconds);
             }
 
+            if (stops.Count > 1 && nextStopId == currentStopId)
+            {
+                int replacementStopId = GetNextNonCurrentStopId(currentStopId);
+                LogInfo(
+                    $"Next stop matched current stop. current={currentStopId}, " +
+                    $"requested={nextStopId}, replacement={replacementStopId}");
+                nextStopId = replacementStopId;
+            }
+
             if (!TryGetStop(nextStopId, out DRTStop nextStop))
             {
                 FinishEpisode($"No valid next stop found. Requested Stop={nextStopId}");
@@ -637,19 +746,20 @@ namespace DRT
 
             Vector3 servicePoint = GetStopServicePoint(nextStop);
             LogRouteDiagnostics(nextStop, servicePoint);
-            var path = API.GetPath(GetControlledVehicleBodyPosition(), servicePoint, controlledVehicleType);
+            Vector3 routeStartPoint = GetGleyRouteStartPoint(out int routeStartWaypointIndex);
+            var path = API.GetPath(routeStartPoint, servicePoint, controlledVehicleType);
             if (path == null || path.Count == 0)
             {
                 driving = false;
                 Debug.LogWarning(
                     $"[BUSCONTROLLER] PathAssignmentSkipped playerVehicle={ControlledVehicleName}, candidateStop={nextStop.StopId}, " +
-                    $"candidateObject={nextStop.name}. " +
+                    $"candidateObject={nextStop.name}, routeStartWaypoint={routeStartWaypointIndex}. " +
                     "Check that this BusStop is close to a Gley traffic waypoint and allowed for this vehicle type.");
                 FinishFailedEpisode($"Path assignment failed. Requested Stop={nextStop.StopId}");
                 yield break;
             }
 
-            if (!playerVehicleDriver.SetPath(path, servicePoint))
+            if (vehicleDriver == null || !vehicleDriver.SetPath(path, servicePoint))
             {
                 driving = false;
                 FinishFailedEpisode($"Player path assignment failed. Requested Stop={nextStop.StopId}");
@@ -659,7 +769,80 @@ namespace DRT
             targetStopId = nextStop.StopId;
             driving = true;
             ResetLegSafetyState(GetControlledVehicleBodyPosition());
-            LogPathAssignment(nextStop, servicePoint, path);
+            LogPathAssignment(nextStop, servicePoint, path, routeStartWaypointIndex);
+        }
+
+        private int GetNextNonCurrentStopId(int stopId)
+        {
+            if (stops == null || stops.Count == 0)
+            {
+                return -1;
+            }
+
+            int firstValidStopId = -1;
+            for (int i = 0; i < stops.Count; i++)
+            {
+                if (stops[i] == null)
+                {
+                    continue;
+                }
+
+                if (firstValidStopId < 1)
+                {
+                    firstValidStopId = stops[i].StopId;
+                }
+
+                if (stops[i].StopId == stopId)
+                {
+                    for (int offset = 1; offset < stops.Count; offset++)
+                    {
+                        DRTStop candidate = stops[(i + offset) % stops.Count];
+                        if (candidate != null && candidate.StopId != stopId)
+                        {
+                            return candidate.StopId;
+                        }
+                    }
+                }
+            }
+
+            return firstValidStopId != stopId ? firstValidStopId : -1;
+        }
+
+        private Vector3 GetGleyRouteStartPoint(out int waypointIndex)
+        {
+            if (currentStopId > 0 && TryGetStop(currentStopId, out DRTStop currentStop))
+            {
+                Vector3 currentStopServicePoint = GetStopServicePoint(currentStop);
+                var currentStopWaypoint = API.GetClosestWaypoint(currentStopServicePoint);
+                if (currentStopWaypoint != null)
+                {
+                    waypointIndex = currentStopWaypoint.ListIndex;
+                    return currentStopWaypoint.Position;
+                }
+            }
+
+            Vector3 bodyPosition = GetControlledVehicleBodyPosition();
+            Transform controlledTransform = GetControlledVehicleTransform();
+            Vector3 forward = controlledTransform != null
+                ? controlledTransform.forward
+                : transform.forward;
+
+            var directedWaypoint = API.GetClosestWaypointInDirection(bodyPosition, forward);
+            if (directedWaypoint != null)
+            {
+                waypointIndex = directedWaypoint.ListIndex;
+                return directedWaypoint.Position;
+            }
+
+            var closestWaypoint = API.GetClosestWaypoint(bodyPosition);
+            if (closestWaypoint != null)
+            {
+                waypointIndex = closestWaypoint.ListIndex;
+                return closestWaypoint.Position;
+            }
+
+            waypointIndex = -1;
+            return bodyPosition;
         }
 
         private IEnumerator ExecuteMatrixTeleportLeg(DRTStop nextStop)
@@ -679,6 +862,7 @@ namespace DRT
 
             episodeTimeSeconds += travelSeconds;
             episodeTravelDistanceMeters += travelSeconds * matrixNominalSpeedMetersPerSecond;
+            AdvanceDemandToCurrentTime();
             passengerManager?.UpdateRequestStates(episodeTimeSeconds);
             TeleportControlledVehicleToStop(nextStop);
 
@@ -708,13 +892,14 @@ namespace DRT
                 return true;
             }
 
+            AdvanceDemandToCurrentTime();
             var stopResult = passengerManager.ProcessStopArrival(
                 currentStopId,
                 episodeTimeSeconds,
                 SuppressUnityLogsDuringMatrixTraining);
             nextStopSelector.RecordStopArrival(stopResult, episodeTimeSeconds);
 
-            if (stopWhenAllRequestsCompleted && !passengerManager.HasUnfinishedRequests(episodeTimeSeconds))
+            if (stopWhenAllRequestsCompleted && !HasUnfinishedOrPendingRequests())
             {
                 FinishEpisode("All passenger requests completed.");
                 return true;
@@ -729,23 +914,37 @@ namespace DRT
             return false;
         }
 
+        private void AdvanceDemandToCurrentTime()
+        {
+            demandGenerator?.SpawnDueRequests(episodeTimeSeconds, SuppressUnityLogsDuringMatrixTraining);
+        }
+
+        private bool HasUnfinishedOrPendingRequests()
+        {
+            bool hasUnfinishedRequests = passengerManager != null &&
+                                         passengerManager.HasUnfinishedRequests(episodeTimeSeconds);
+            bool hasPendingScenarioDemand = demandGenerator != null && demandGenerator.HasPendingDemand;
+            return hasUnfinishedRequests || hasPendingScenarioDemand;
+        }
+
         private void TeleportControlledVehicleToStop(DRTStop stop)
         {
-            if (stop == null || !ResolveControlledPlayerVehicle(false))
+            if (stop == null || !ResolveControlledVehicle(false))
             {
                 return;
             }
 
             Vector3 servicePoint = GetStopServicePoint(stop);
-            Quaternion rotation = controlledPlayerVehicle != null ? controlledPlayerVehicle.rotation : Quaternion.identity;
+            Transform controlledTransform = GetControlledVehicleTransform();
+            Quaternion rotation = controlledTransform != null ? controlledTransform.rotation : Quaternion.identity;
             TrafficWaypoint closestWaypoint = API.IsInitialized() ? API.GetClosestWaypoint(servicePoint) : null;
             if (closestWaypoint != null)
             {
                 rotation = GetWaypointForwardRotation(closestWaypoint, rotation);
             }
 
-            playerVehicleDriver.TeleportTo(servicePoint, rotation);
-            ApplyCameraFollow(controlledPlayerVehicle);
+            vehicleDriver.TeleportTo(servicePoint, rotation, closestWaypoint != null ? closestWaypoint.ListIndex : -1);
+            ApplyCameraFollow(GetControlledVehicleTransform());
             ResetLegSafetyState(GetControlledVehicleBodyPosition());
             ResetTravelDistanceSample(GetControlledVehicleBodyPosition());
         }
@@ -829,6 +1028,11 @@ namespace DRT
             {
                 if (vehicles[i] != null && vehicles[i].gameObject.activeSelf)
                 {
+                    if (UsesGleyVehicleControl && i == vehicleIndex)
+                    {
+                        continue;
+                    }
+
                     API.RemoveVehicle(i);
                     removedCount++;
                 }
@@ -855,6 +1059,11 @@ namespace DRT
             {
                 if (vehicles[i] != null && vehicles[i].gameObject.activeSelf)
                 {
+                    if (UsesGleyVehicleControl && i == vehicleIndex)
+                    {
+                        continue;
+                    }
+
                     count++;
                 }
             }
@@ -1005,7 +1214,8 @@ namespace DRT
 
         private void LogRouteDiagnostics(DRTStop stop, Vector3 servicePoint)
         {
-            if (controlledPlayerVehicle == null || stop == null)
+            Transform controlledTransform = GetControlledVehicleTransform();
+            if (controlledTransform == null || stop == null)
             {
                 return;
             }
@@ -1013,31 +1223,36 @@ namespace DRT
             Vector3 bodyPosition = GetControlledVehicleBodyPosition();
             var closestStopWaypoint = API.GetClosestWaypoint(stop.Position);
             var closestPlayerWaypoint = API.GetClosestWaypoint(bodyPosition);
+            var directedPlayerWaypoint = API.GetClosestWaypointInDirection(bodyPosition, controlledTransform.forward);
             float stopToWaypointDistance = closestStopWaypoint != null
                 ? GetPlanarDistance(stop.Position, closestStopWaypoint.Position)
                 : float.PositiveInfinity;
             float bodyToStopDistance = GetPlanarDistance(bodyPosition, stop.Position);
             float bodyToServiceDistance = GetPlanarDistance(bodyPosition, servicePoint);
             int currentWaypoint = closestPlayerWaypoint != null ? closestPlayerWaypoint.ListIndex : -1;
+            int directedWaypoint = directedPlayerWaypoint != null ? directedPlayerWaypoint.ListIndex : -1;
 
             Debug.Log(
                 $"[BUSCONTROLLER] RouteRequest playerVehicle={ControlledVehicleName}, currentWaypoint={currentWaypoint}, " +
+                $"directedWaypoint={directedWaypoint}, " +
                 $"targetStop={stop.StopId}, targetObject={stop.name}, bodyToService={FormatMeters(bodyToServiceDistance)}, " +
                 $"bodyToStopMarker={FormatMeters(bodyToStopDistance)}, " +
                 $"servicePoint={FormatVector(servicePoint)}, stopMarker={FormatVector(stop.Position)}, " +
                 $"stopToClosestWaypoint={FormatMeters(stopToWaypointDistance)}");
         }
 
-        private void LogPathAssignment(DRTStop targetStop, Vector3 servicePoint, List<int> path)
+        private void LogPathAssignment(DRTStop targetStop, Vector3 servicePoint, List<int> path, int routeStartWaypointIndex)
         {
             string endpointDescription = DescribePathEndpoint(path, servicePoint, out float endToServiceDistance);
             float warningDistance = Mathf.Max(15f, arrivalDistanceMeters + stopWaypointSnapDistanceMeters);
             string integrity = endToServiceDistance <= warningDistance ? "ok" : "warning";
+            string pathPreview = BuildPathPreview(path, 12);
 
             string message =
                 $"[BUSCONTROLLER] PathAssigned integrity={integrity}, playerVehicle={ControlledVehicleName}, " +
-                $"targetStop={targetStop.StopId}, targetObject={targetStop.name}, pathWaypoints={path.Count}, " +
-                $"servicePoint={FormatVector(servicePoint)}, {endpointDescription}";
+                $"targetStop={targetStop.StopId}, targetObject={targetStop.name}, routeStartWaypoint={routeStartWaypointIndex}, " +
+                $"pathWaypoints={path.Count}, servicePoint={FormatVector(servicePoint)}, {endpointDescription}, " +
+                $"pathPreview=[{pathPreview}]";
 
             if (integrity == "warning")
             {
@@ -1047,6 +1262,34 @@ namespace DRT
             {
                 Debug.Log(message);
             }
+        }
+
+        private string BuildPathPreview(List<int> path, int maxItems)
+        {
+            if (path == null || path.Count == 0)
+            {
+                return "-";
+            }
+
+            var builder = new System.Text.StringBuilder();
+            int count = Mathf.Min(path.Count, Mathf.Max(1, maxItems));
+            for (int i = 0; i < count; i++)
+            {
+                var waypoint = API.GetWaypointFromIndex(path[i]);
+                if (i > 0)
+                {
+                    builder.Append(" -> ");
+                }
+
+                builder.Append(waypoint != null ? waypoint.Name : path[i].ToString());
+            }
+
+            if (path.Count > count)
+            {
+                builder.Append(" -> ...");
+            }
+
+            return builder.ToString();
         }
 
         private string DescribePathEndpoint(List<int> path, Vector3 servicePoint, out float endToServiceDistance)
@@ -1079,7 +1322,7 @@ namespace DRT
                 return;
             }
 
-            if (!ResolveControlledPlayerVehicle(true) || !controlledPlayerVehicle.gameObject.activeSelf)
+            if (!ResolveControlledVehicle(true) || vehicleDriver == null || vehicleDriver.VehicleTransform == null || !vehicleDriver.VehicleTransform.gameObject.activeSelf)
             {
                 FinishFailedEpisode("Player vehicle is missing or inactive.");
                 return;
@@ -1171,7 +1414,7 @@ namespace DRT
 
         private void TrackPhysicalTravelDistanceIfNeeded()
         {
-            if (UsesMatrixTeleportTraining || !initialized || episodeFinished || controlledPlayerVehicle == null)
+            if (UsesMatrixTeleportTraining || !initialized || episodeFinished || GetControlledVehicleTransform() == null)
             {
                 return;
             }
@@ -1208,23 +1451,24 @@ namespace DRT
             Debug.Log(
                 $"[BUSCONTROLLER] MoveStatus playerVehicle={ControlledVehicleName}, targetStop={targetStopId}, " +
                 $"distance={FormatMeters(GetTargetDistanceMeters())}, speed={GetVehicleSpeedMS():0.00}m/s, " +
-                $"pathPoints={playerVehicleDriver?.PathPointCount}, remainingPoints={playerVehicleDriver?.RemainingPathPointCount}, " +
+                $"pathPoints={vehicleDriver?.PathPointCount}, remainingPoints={vehicleDriver?.RemainingPathPointCount}, " +
                 $"waitingForArrival={waitingForArrivalProximity}");
         }
 
         private float GetVehicleSpeedMS()
         {
-            if (playerVehicleDriver != null)
+            if (vehicleDriver != null)
             {
-                return playerVehicleDriver.CurrentSpeedMS;
+                return vehicleDriver.CurrentSpeedMS;
             }
 
-            if (controlledPlayerVehicle == null)
+            Transform controlledTransform = GetControlledVehicleTransform();
+            if (controlledTransform == null)
             {
                 return 0f;
             }
 
-            var body = controlledPlayerVehicle.GetComponent<Rigidbody>();
+            var body = controlledTransform.GetComponent<Rigidbody>();
             if (body == null)
             {
                 return 0f;
@@ -1254,7 +1498,7 @@ namespace DRT
                 return float.PositiveInfinity;
             }
 
-            if (!ResolveControlledPlayerVehicle(false))
+            if (!ResolveControlledVehicle(false))
             {
                 return float.PositiveInfinity;
             }
@@ -1283,12 +1527,13 @@ namespace DRT
 
         private Vector3 GetControlledVehicleBodyPosition()
         {
-            if (playerVehicleDriver != null)
+            if (vehicleDriver != null)
             {
-                return playerVehicleDriver.BodyPosition;
+                return vehicleDriver.BodyPosition;
             }
 
-            return controlledPlayerVehicle != null ? controlledPlayerVehicle.position : Vector3.zero;
+            Transform controlledTransform = GetControlledVehicleTransform();
+            return controlledTransform != null ? controlledTransform.position : Vector3.zero;
         }
 
         private static float GetPlanarDistance(Vector3 a, Vector3 b)
@@ -1330,12 +1575,11 @@ namespace DRT
                 return;
             }
 
-            bool completedAllRequests = passengerManager != null &&
-                                        !passengerManager.HasUnfinishedRequests(episodeTimeSeconds);
+            bool completedAllRequests = !HasUnfinishedOrPendingRequests();
             episodeFinished = true;
             driving = false;
             waitingForArrivalProximity = false;
-            playerVehicleDriver?.StopAndHold(true);
+            vehicleDriver?.StopAndHold(true);
 
             LogInfo($"[BUSCONTROLLER] Episode finished. {reason}");
 

@@ -6,7 +6,7 @@ namespace DRT
 {
     public class DRTPassengerManager : MonoBehaviour
     {
-        [SerializeField] private int busCapacity = 12;
+        [SerializeField] private int busCapacity = 6;
         [SerializeField] private bool logStopProcessing = true;
         [SerializeField] private List<DRTPassengerRequest> requests = new List<DRTPassengerRequest>();
 

@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 using Gley.TrafficSystem;
 using Gley.UrbanSystem;
@@ -8,6 +9,7 @@ namespace DRT
     {
         private const string SystemObjectName = "DRTSystem";
         private const string BusStopsObjectName = "BusStops";
+        private const int GleyChangeLanePenalty = 10;
 
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
         private static void Setup()
@@ -22,8 +24,15 @@ namespace DRT
             DisableGleyTrafficExample();
             EnsurePathFindingEnabled();
 
+            var existingBusControllers = Object.FindObjectsOfType<DRTBusController>();
+            DRTBusController configuredBusController = SelectConfiguredBusController(existingBusControllers);
+
             GameObject systemObject = GameObject.Find(SystemObjectName);
-            if (systemObject == null)
+            if (configuredBusController != null)
+            {
+                systemObject = configuredBusController.gameObject;
+            }
+            else if (systemObject == null)
             {
                 systemObject = new GameObject(SystemObjectName);
             }
@@ -39,7 +48,35 @@ namespace DRT
             busController.Configure(busStopsRoot, passengerManager, demandGenerator, nextStopSelector, 0, 1);
             debugGui.Configure(passengerManager, busController);
 
-            Debug.Log($"[DRT] Auto setup complete. Stops={busStopsRoot.childCount}");
+            Debug.Log(
+                $"[DRT] Auto setup complete. Stops={busStopsRoot.childCount}, " +
+                $"systemObject={systemObject.name}, mode={busController.TravelExecutionModeName}");
+        }
+
+        private static DRTBusController SelectConfiguredBusController(DRTBusController[] busControllers)
+        {
+            if (busControllers == null || busControllers.Length == 0)
+            {
+                return null;
+            }
+
+            for (int i = 0; i < busControllers.Length; i++)
+            {
+                var busController = busControllers[i];
+                if (busController != null && busController.gameObject.name == SystemObjectName)
+                {
+                    return busController;
+                }
+            }
+
+            if (busControllers.Length > 1)
+            {
+                Debug.LogWarning(
+                    $"[DRT] Multiple DRTBusController components found. " +
+                    $"Using '{busControllers[0].gameObject.name}'. Remove duplicates to avoid unexpected run mode.");
+            }
+
+            return busControllers[0];
         }
 
         private static void EnsurePathFindingEnabled()
@@ -69,6 +106,7 @@ namespace DRT
             }
 
             var pathFindingWaypoints = new PathFindingWaypoint[trafficWaypoints.Length];
+            int laneChangeEdges = 0;
             for (int i = 0; i < trafficWaypoints.Length; i++)
             {
                 var waypoint = trafficWaypoints[i];
@@ -78,19 +116,69 @@ namespace DRT
                     allowedAgents[agentIndex] = (int)waypoint.AllowedVehicles[agentIndex];
                 }
 
+                int[] movementPenalties;
+                int[] neighbours = BuildGleyPathFindingNeighbours(waypoint, out movementPenalties, out int addedLaneChangeEdges);
+                laneChangeEdges += addedLaneChangeEdges;
+
                 pathFindingWaypoints[i] = new PathFindingWaypoint(
                     waypoint.ListIndex,
                     waypoint.Position,
                     0,
                     0,
                     -1,
-                    waypoint.Neighbors,
-                    new int[waypoint.Neighbors.Length],
+                    neighbours,
+                    movementPenalties,
                     allowedAgents);
             }
 
             pathFindingData.SetPathFindingWaypoints(pathFindingWaypoints);
-            Debug.Log($"[DRT] Runtime Path Finding enabled. Waypoints={pathFindingWaypoints.Length}");
+            Debug.Log($"[DRT] Runtime Path Finding enabled. Waypoints={pathFindingWaypoints.Length}, laneChangeEdges={laneChangeEdges}");
+        }
+
+        private static int[] BuildGleyPathFindingNeighbours(
+            TrafficWaypoint waypoint,
+            out int[] movementPenalties,
+            out int laneChangeEdges)
+        {
+            var neighbours = new List<int>();
+            var penalties = new List<int>();
+            laneChangeEdges = 0;
+
+            AddPathFindingNeighbours(waypoint.Neighbors, 0, neighbours, penalties, ref laneChangeEdges, false);
+            AddPathFindingNeighbours(waypoint.OtherLanes, GleyChangeLanePenalty, neighbours, penalties, ref laneChangeEdges, true);
+
+            movementPenalties = penalties.ToArray();
+            return neighbours.ToArray();
+        }
+
+        private static void AddPathFindingNeighbours(
+            int[] source,
+            int movementPenalty,
+            List<int> neighbours,
+            List<int> penalties,
+            ref int laneChangeEdges,
+            bool countAsLaneChange)
+        {
+            if (source == null)
+            {
+                return;
+            }
+
+            for (int i = 0; i < source.Length; i++)
+            {
+                int neighbour = source[i];
+                if (neighbour < 0 || neighbours.Contains(neighbour))
+                {
+                    continue;
+                }
+
+                neighbours.Add(neighbour);
+                penalties.Add(movementPenalty);
+                if (countAsLaneChange)
+                {
+                    laneChangeEdges++;
+                }
+            }
         }
 
         private static Transform FindBusStopsRoot()

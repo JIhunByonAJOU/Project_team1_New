@@ -26,13 +26,20 @@ namespace DRT
         public int ActualPickupStopId => actualPickupStopId;
         public int ActualDropoffStopId => actualDropoffStopId;
 
-        public DRTPassengerRequest(int passengerId, int originStopId, int destinationStopId, float requestTimeSeconds)
+        public DRTPassengerRequest(
+            int passengerId,
+            int originStopId,
+            int destinationStopId,
+            float requestTimeSeconds,
+            DRTPassengerStatus initialStatus = DRTPassengerStatus.Scheduled)
         {
             this.passengerId = passengerId;
             this.originStopId = originStopId;
             this.destinationStopId = destinationStopId;
             this.requestTimeSeconds = Mathf.Max(0f, requestTimeSeconds);
-            status = DRTPassengerStatus.Scheduled;
+            status = initialStatus == DRTPassengerStatus.Waiting
+                ? DRTPassengerStatus.Waiting
+                : DRTPassengerStatus.Scheduled;
         }
 
         public void SetPassengerId(int newPassengerId)

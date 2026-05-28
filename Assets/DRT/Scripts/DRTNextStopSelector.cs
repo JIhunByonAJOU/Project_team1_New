@@ -43,6 +43,9 @@ namespace DRT
         [SerializeField] private float distancePenaltyWeight = 0.002f;
         [SerializeField] private bool logDecision = true;
 
+        [Header("Diagnostics")]
+        [SerializeField] private bool logPolicyAction = true;
+
         private IReadOnlyList<DRTStop> decisionStops;
         private DRTPassengerManager decisionPassengerManager;
         private int decisionCurrentStopId;
@@ -282,7 +285,9 @@ namespace DRT
             }
 
             int actionIndex = actionBuffers.DiscreteActions.Length > 0 ? actionBuffers.DiscreteActions[0] : -1;
-            selectedStopId = GetStopIdFromAction(actionIndex);
+            int rawStopId = GetStopIdFromAction(actionIndex, false);
+            selectedStopId = GetStopIdFromAction(actionIndex, true);
+            bool usedFallback = selectedStopId < 1;
 
             if (selectedStopId < 1)
             {
@@ -301,6 +306,7 @@ namespace DRT
                     decisionEpisodeTime);
             }
 
+            LogPolicyAction(actionIndex, rawStopId, selectedStopId, usedFallback);
             lastSelectedStopId = selectedStopId;
             decisionPending = false;
             decisionReady = true;
@@ -389,7 +395,12 @@ namespace DRT
                 return bestStopId;
             }
 
-            if (passengerManager.TryGetNextScheduledOrigin(currentEpisodeTime, out int scheduledOriginStopId))
+            if (TryGetNextScheduledOriginExcludingCurrent(
+                    currentStopId,
+                    stops,
+                    passengerManager,
+                    currentEpisodeTime,
+                    out int scheduledOriginStopId))
             {
                 LogSelectedStop("next-scheduled-origin", scheduledOriginStopId, currentStopId, currentEpisodeTime, passengerManager, bestScore, scoreSummary.ToString());
                 return scheduledOriginStopId;
@@ -398,6 +409,54 @@ namespace DRT
             int sequentialStopId = GetNextSequentialStopId(currentStopId, stops);
             LogSelectedStop("sequential-fallback", sequentialStopId, currentStopId, currentEpisodeTime, passengerManager, bestScore, scoreSummary.ToString());
             return sequentialStopId;
+        }
+
+        private bool TryGetNextScheduledOriginExcludingCurrent(
+            int currentStopId,
+            IReadOnlyList<DRTStop> stops,
+            DRTPassengerManager passengerManager,
+            float currentEpisodeTime,
+            out int scheduledOriginStopId)
+        {
+            scheduledOriginStopId = -1;
+
+            if (passengerManager == null)
+            {
+                return false;
+            }
+
+            if (!passengerManager.TryGetNextScheduledOrigin(currentEpisodeTime, out int nextOriginStopId))
+            {
+                return false;
+            }
+
+            if (!skipCurrentStop || stops == null || stops.Count <= 1 || nextOriginStopId != currentStopId)
+            {
+                scheduledOriginStopId = nextOriginStopId;
+                return true;
+            }
+
+            float bestRequestTime = float.PositiveInfinity;
+            var requests = passengerManager.Requests;
+            for (int i = 0; i < requests.Count; i++)
+            {
+                var request = requests[i];
+                if (request == null ||
+                    request.Status != DRTPassengerStatus.Scheduled ||
+                    request.OriginStopId == currentStopId ||
+                    FindStop(stops, request.OriginStopId) == null)
+                {
+                    continue;
+                }
+
+                if (request.RequestTimeSeconds < bestRequestTime)
+                {
+                    bestRequestTime = request.RequestTimeSeconds;
+                    scheduledOriginStopId = request.OriginStopId;
+                }
+            }
+
+            return scheduledOriginStopId >= 1;
         }
 
         private void LogSelectedStop(
@@ -424,7 +483,7 @@ namespace DRT
                 $"bestScore={bestScore:0.00} scores=[{scoreSummary}]");
         }
 
-        private int GetStopIdFromAction(int actionIndex)
+        private int GetStopIdFromAction(int actionIndex, bool enforceCurrentStopMask = true)
         {
             if (decisionStops == null || actionIndex < 0 || actionIndex >= decisionStops.Count || actionIndex >= maxStops)
             {
@@ -437,12 +496,84 @@ namespace DRT
                 return -1;
             }
 
-            if (skipCurrentStop && decisionStops.Count > 1 && stop.StopId == decisionCurrentStopId)
+            if (enforceCurrentStopMask && skipCurrentStop && decisionStops.Count > 1 && stop.StopId == decisionCurrentStopId)
             {
                 return -1;
             }
 
             return stop.StopId;
+        }
+
+        private void LogPolicyAction(int actionIndex, int rawStopId, int finalStopId, bool usedFallback)
+        {
+            if (!logPolicyAction || ShouldSuppressUnityLogs())
+            {
+                return;
+            }
+
+            int waitingTotal = decisionPassengerManager != null
+                ? decisionPassengerManager.GetWaitingCount(decisionEpisodeTime)
+                : 0;
+            int onBoard = decisionPassengerManager != null
+                ? decisionPassengerManager.GetOnBoardCount()
+                : 0;
+
+            Debug.Log(
+                $"[NEXTSTOPSELECTOR] PolicyAction t={decisionEpisodeTime:0.0}s current={decisionCurrentStopId} " +
+                $"rawAction={actionIndex}, rawStop={FormatStopId(rawStopId)}, selected={FormatStopId(finalStopId)}, " +
+                $"fallback={usedFallback}, waitingTotal={waitingTotal}, onBoard={onBoard}, " +
+                $"policy={GetPolicySummary()}, demand=[{BuildDecisionDemandSummary()}]");
+        }
+
+        private string GetPolicySummary()
+        {
+            var behaviorParameters = GetComponent<BehaviorParameters>();
+            if (behaviorParameters == null)
+            {
+                return "BehaviorParametersMissing";
+            }
+
+            string modelName = behaviorParameters.Model != null ? behaviorParameters.Model.name : "-";
+            return $"{behaviorParameters.BehaviorType}/model={modelName}";
+        }
+
+        private string BuildDecisionDemandSummary()
+        {
+            if (decisionStops == null || decisionPassengerManager == null)
+            {
+                return "-";
+            }
+
+            int stopCount = Mathf.Min(decisionStops.Count, maxStops);
+            var summary = new StringBuilder();
+
+            for (int i = 0; i < stopCount; i++)
+            {
+                var stop = decisionStops[i];
+                if (stop == null)
+                {
+                    continue;
+                }
+
+                if (summary.Length > 0)
+                {
+                    summary.Append("; ");
+                }
+
+                summary.Append("S")
+                    .Append(stop.StopId)
+                    .Append("(w=").Append(decisionPassengerManager.GetWaitingCountAtStop(stop.StopId, decisionEpisodeTime))
+                    .Append(",drop=").Append(decisionPassengerManager.GetOnBoardDestinationCount(stop.StopId))
+                    .Append(",future=").Append(decisionPassengerManager.GetScheduledCountAtStop(stop.StopId, decisionEpisodeTime))
+                    .Append(")");
+            }
+
+            return summary.Length > 0 ? summary.ToString() : "-";
+        }
+
+        private static string FormatStopId(int stopId)
+        {
+            return stopId >= 1 ? stopId.ToString() : "-";
         }
 
         private int FindActionIndexForStop(int stopId)
@@ -684,7 +815,15 @@ namespace DRT
             }
 
             behaviorParameters.BehaviorName = BehaviorName;
-            behaviorParameters.BehaviorType = BehaviorType.Default;
+            if (behaviorParameters.Model != null)
+            {
+                behaviorParameters.BehaviorType = BehaviorType.InferenceOnly;
+            }
+            else if (behaviorParameters.BehaviorType == BehaviorType.HeuristicOnly)
+            {
+                behaviorParameters.BehaviorType = BehaviorType.Default;
+            }
+
             behaviorParameters.BrainParameters.VectorObservationSize = ObservationSize;
             behaviorParameters.BrainParameters.NumStackedVectorObservations = 1;
             behaviorParameters.BrainParameters.ActionSpec = new ActionSpec(0, new[] { maxStops });

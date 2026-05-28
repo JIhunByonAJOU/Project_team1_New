@@ -1,29 +1,77 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
+using System.Text;
 using UnityEngine;
 
 namespace DRT
 {
+    public enum DRTDemandSource
+    {
+        CsvResourcePreset,
+        CsvTextAsset,
+        InspectorSchedule,
+        RuleBasedDefault
+    }
+
+    public enum DRTDemandCsvPreset
+    {
+        Scenario14Passengers,
+        Scenario18Passengers,
+        Scenario22Passengers,
+        Scenario30Passengers,
+        CustomResourceName
+    }
+
     [Serializable]
     public class DRTDemandScheduleEntry
     {
+        [Min(0)] public int passengerId;
         [Min(0f)] public float requestTimeSeconds;
         [Min(1)] public int originStopId = 1;
         [Min(1)] public int destinationStopId = 2;
         [Min(1)] public int passengerCount = 1;
+        public DRTPassengerStatus initialStatus = DRTPassengerStatus.Scheduled;
     }
 
     public class DRTDemandGenerator : MonoBehaviour
     {
+        private const string Scenario14ResourceName = "drt_scenario_14";
+        private const string Scenario18ResourceName = "drt_scenario_18";
+        private const string Scenario22ResourceName = "drt_scenario_22";
+        private const string Scenario30ResourceName = "drt_scenario_30";
+
+        [Header("Scene References")]
         [SerializeField] private DRTPassengerManager passengerManager;
+
+        [Header("Scenario Source")]
         [SerializeField] private bool generateOnStart;
         [SerializeField] private bool clearExistingRequests = true;
+        [SerializeField] private DRTDemandSource demandSource = DRTDemandSource.CsvResourcePreset;
+        [SerializeField] private DRTDemandCsvPreset csvPreset = DRTDemandCsvPreset.Scenario14Passengers;
+        [SerializeField] private TextAsset scenarioCsvAsset;
+        [SerializeField] private string customScenarioResourceName = Scenario14ResourceName;
+        [SerializeField] private bool spawnRequestsAtRequestTime = true;
+
+        [Header("Fallback / Manual Demand")]
         [SerializeField] private int stopCount = 8;
         [SerializeField] private float episodeLengthSeconds = 3600f;
-        [SerializeField, Range(6, 22)] private int defaultRequestCount = 14;
+        [SerializeField, Range(6, 30)] private int defaultRequestCount = 14;
         [SerializeField] private List<DRTDemandScheduleEntry> demandSchedule = new List<DRTDemandScheduleEntry>();
 
+        [Header("Diagnostics")]
+        [SerializeField] private bool logSpawnedRequests;
+
+        private readonly List<DRTDemandReplayEntry> replaySchedule = new List<DRTDemandReplayEntry>();
+        private int nextReplayIndex;
+        private int loadedPassengerCount;
+        private string loadedScenarioDescription = "-";
+
         public bool HasGenerated { get; private set; }
+        public int LoadedPassengerCount => loadedPassengerCount;
+        public int SpawnedPassengerCount { get; private set; }
+        public int PendingDemandCount => CountPendingPassengers();
+        public bool HasPendingDemand => HasGenerated && spawnRequestsAtRequestTime && nextReplayIndex < replaySchedule.Count;
 
         public void Configure(DRTPassengerManager newPassengerManager, int newStopCount)
         {
@@ -47,14 +95,8 @@ namespace DRT
 
         public void GenerateDemand(bool suppressLog)
         {
-            if (passengerManager == null)
+            if (!EnsurePassengerManager())
             {
-                passengerManager = FindObjectOfType<DRTPassengerManager>();
-            }
-
-            if (passengerManager == null)
-            {
-                Debug.LogError("[DRT] Cannot generate demand. PassengerManager is missing.");
                 return;
             }
 
@@ -63,8 +105,20 @@ namespace DRT
                 passengerManager.ClearRequests();
             }
 
-            var sourceSchedule = demandSchedule.Count > 0 ? demandSchedule : BuildDefaultRuleBasedSchedule();
+            replaySchedule.Clear();
+            nextReplayIndex = 0;
+            loadedPassengerCount = 0;
+            SpawnedPassengerCount = 0;
+            loadedScenarioDescription = "-";
 
+            if (!TryBuildReplaySchedule(out List<DRTDemandReplayEntry> sourceSchedule, out string error))
+            {
+                HasGenerated = false;
+                Debug.LogError($"[DEMANDGENERATOR] Cannot load demand scenario. {error}");
+                return;
+            }
+
+            sourceSchedule.Sort(CompareReplayEntries);
             for (int i = 0; i < sourceSchedule.Count; i++)
             {
                 var entry = sourceSchedule[i];
@@ -73,22 +127,27 @@ namespace DRT
                     continue;
                 }
 
-                for (int passenger = 0; passenger < entry.passengerCount; passenger++)
-                {
-                    passengerManager.AddRequest(
-                        entry.originStopId,
-                        entry.destinationStopId,
-                        entry.requestTimeSeconds);
-                }
+                replaySchedule.Add(entry);
+                loadedPassengerCount += Mathf.Max(1, entry.passengerCount);
             }
 
             HasGenerated = true;
+            if (spawnRequestsAtRequestTime)
+            {
+                SpawnDueRequests(0f, suppressLog);
+            }
+            else
+            {
+                SpawnAllRequests(suppressLog);
+            }
+
             if (!suppressLog)
             {
                 Debug.Log(
-                    $"[DEMANDGENERATOR] Generated requests={passengerManager.Requests.Count}, " +
-                    $"stopCount={stopCount}, scheduleEntries={sourceSchedule.Count}, " +
-                    $"firstRequest={FormatFirstRequest()}");
+                    $"[DEMANDGENERATOR] Loaded scenario={loadedScenarioDescription}, " +
+                    $"rows={replaySchedule.Count}, passengers={loadedPassengerCount}, " +
+                    $"spawnByTime={spawnRequestsAtRequestTime}, active={passengerManager.Requests.Count}, " +
+                    $"pending={PendingDemandCount}, first={FormatFirstScenarioEntry()}");
             }
         }
 
@@ -103,11 +162,224 @@ namespace DRT
             GenerateDemand(suppressLog);
         }
 
-        private List<DRTDemandScheduleEntry> BuildDefaultRuleBasedSchedule()
+        public int SpawnDueRequests(float currentEpisodeTime)
         {
-            var result = new List<DRTDemandScheduleEntry>();
+            return SpawnDueRequests(currentEpisodeTime, false);
+        }
+
+        public int SpawnDueRequests(float currentEpisodeTime, bool suppressLog)
+        {
+            if (!HasGenerated)
+            {
+                GenerateDemand(suppressLog);
+            }
+
+            if (!HasGenerated || !spawnRequestsAtRequestTime || !EnsurePassengerManager())
+            {
+                return 0;
+            }
+
+            int spawned = 0;
+            float safeEpisodeTime = Mathf.Max(0f, currentEpisodeTime);
+            while (nextReplayIndex < replaySchedule.Count &&
+                   replaySchedule[nextReplayIndex].requestTimeSeconds <= safeEpisodeTime + 0.0001f)
+            {
+                spawned += SpawnEntry(replaySchedule[nextReplayIndex], true);
+                nextReplayIndex++;
+            }
+
+            if (spawned > 0 && logSpawnedRequests && !suppressLog)
+            {
+                Debug.Log(
+                    $"[DEMANDGENERATOR] Spawned due requests={spawned}, " +
+                    $"time={safeEpisodeTime:0.0}s, active={passengerManager.Requests.Count}, pending={PendingDemandCount}");
+            }
+
+            return spawned;
+        }
+
+        private bool TryBuildReplaySchedule(out List<DRTDemandReplayEntry> result, out string error)
+        {
+            result = null;
+            error = null;
+
+            switch (demandSource)
+            {
+                case DRTDemandSource.CsvResourcePreset:
+                {
+                    string resourceName = GetSelectedScenarioResourceName();
+                    TextAsset csvAsset = Resources.Load<TextAsset>(resourceName);
+                    if (csvAsset == null)
+                    {
+                        error = $"CSV resource '{resourceName}' was not found under a Resources folder.";
+                        return false;
+                    }
+
+                    loadedScenarioDescription = $"resource:{resourceName}";
+                    return TryParseCsvSchedule(csvAsset.text, loadedScenarioDescription, out result, out error);
+                }
+
+                case DRTDemandSource.CsvTextAsset:
+                {
+                    if (scenarioCsvAsset == null)
+                    {
+                        error = "Scenario CSV TextAsset is not assigned.";
+                        return false;
+                    }
+
+                    loadedScenarioDescription = $"asset:{scenarioCsvAsset.name}";
+                    return TryParseCsvSchedule(scenarioCsvAsset.text, loadedScenarioDescription, out result, out error);
+                }
+
+                case DRTDemandSource.InspectorSchedule:
+                    loadedScenarioDescription = "inspector schedule";
+                    result = BuildInspectorSchedule();
+                    return true;
+
+                case DRTDemandSource.RuleBasedDefault:
+                    loadedScenarioDescription = $"rule-based:{defaultRequestCount}";
+                    result = BuildDefaultRuleBasedSchedule();
+                    return true;
+
+                default:
+                    error = $"Unsupported demand source: {demandSource}";
+                    return false;
+            }
+        }
+
+        private bool TryParseCsvSchedule(
+            string csvText,
+            string sourceDescription,
+            out List<DRTDemandReplayEntry> result,
+            out string error)
+        {
+            result = new List<DRTDemandReplayEntry>();
+            error = null;
+
+            if (string.IsNullOrWhiteSpace(csvText))
+            {
+                error = "CSV text is empty.";
+                return false;
+            }
+
+            string[] rawLines = csvText.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            var lines = new List<string>();
+            for (int i = 0; i < rawLines.Length; i++)
+            {
+                string line = rawLines[i].Trim();
+                if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                lines.Add(line);
+            }
+
+            if (lines.Count < 2)
+            {
+                error = "CSV must contain a header row and at least one passenger row.";
+                return false;
+            }
+
+            string[] headers = SplitCsvLine(lines[0]);
+            var columns = new Dictionary<string, int>();
+            for (int i = 0; i < headers.Length; i++)
+            {
+                string normalizedHeader = NormalizeHeader(headers[i]);
+                if (!string.IsNullOrEmpty(normalizedHeader))
+                {
+                    columns[normalizedHeader] = i;
+                }
+            }
+
+            int idColumn = FindColumn(columns, "id", "passengerid", "passenger_id");
+            int fromColumn = FindColumn(columns, "from", "fron", "origin", "originstopid", "origin_stop_id");
+            int toColumn = FindColumn(columns, "to", "destination", "destinationstopid", "destination_stop_id");
+            int reqColumn = FindColumn(columns, "req", "request", "requesttime", "requesttimeseconds", "request_time_seconds", "time");
+            int statusColumn = FindColumn(columns, "status", "state");
+
+            if (idColumn < 0 || fromColumn < 0 || toColumn < 0 || reqColumn < 0)
+            {
+                error = "CSV header must include id, from, to, and req columns. status is optional.";
+                return false;
+            }
+
+            var seenPassengerIds = new HashSet<int>();
+            for (int lineIndex = 1; lineIndex < lines.Count; lineIndex++)
+            {
+                string[] fields = SplitCsvLine(lines[lineIndex]);
+                if (IsEmptyRow(fields))
+                {
+                    continue;
+                }
+
+                int rowNumber = lineIndex + 1;
+                if (!TryReadInt(fields, idColumn, rowNumber, "id", out int passengerId, out error) ||
+                    !TryReadInt(fields, fromColumn, rowNumber, "from", out int originStopId, out error) ||
+                    !TryReadInt(fields, toColumn, rowNumber, "to", out int destinationStopId, out error) ||
+                    !TryReadFloat(fields, reqColumn, rowNumber, "req", out float requestTimeSeconds, out error))
+                {
+                    return false;
+                }
+
+                if (passengerId > 0 && !seenPassengerIds.Add(passengerId))
+                {
+                    error = $"CSV row {rowNumber} duplicates passenger id {passengerId}.";
+                    return false;
+                }
+
+                result.Add(new DRTDemandReplayEntry
+                {
+                    passengerId = passengerId,
+                    requestTimeSeconds = Mathf.Max(0f, requestTimeSeconds),
+                    originStopId = originStopId,
+                    destinationStopId = destinationStopId,
+                    passengerCount = 1,
+                    initialStatus = ReadInitialStatus(fields, statusColumn, rowNumber),
+                    sourceDescription = $"{sourceDescription}:row{rowNumber}"
+                });
+            }
+
+            if (result.Count == 0)
+            {
+                error = "CSV contains no passenger rows.";
+                return false;
+            }
+
+            return true;
+        }
+
+        private List<DRTDemandReplayEntry> BuildInspectorSchedule()
+        {
+            var result = new List<DRTDemandReplayEntry>();
+            for (int i = 0; i < demandSchedule.Count; i++)
+            {
+                var entry = demandSchedule[i];
+                if (entry == null)
+                {
+                    continue;
+                }
+
+                result.Add(new DRTDemandReplayEntry
+                {
+                    passengerId = entry.passengerId,
+                    requestTimeSeconds = Mathf.Max(0f, entry.requestTimeSeconds),
+                    originStopId = entry.originStopId,
+                    destinationStopId = entry.destinationStopId,
+                    passengerCount = Mathf.Max(1, entry.passengerCount),
+                    initialStatus = NormalizeInitialStatus(entry.initialStatus),
+                    sourceDescription = $"inspector:{i + 1}"
+                });
+            }
+
+            return result;
+        }
+
+        private List<DRTDemandReplayEntry> BuildDefaultRuleBasedSchedule()
+        {
+            var result = new List<DRTDemandReplayEntry>();
             int safeStopCount = Mathf.Max(2, stopCount);
-            int safeRequestCount = Mathf.Clamp(defaultRequestCount, 6, 22);
+            int safeRequestCount = Mathf.Clamp(defaultRequestCount, 6, 30);
             float interval = episodeLengthSeconds / safeRequestCount;
 
             for (int i = 0; i < safeRequestCount; i++)
@@ -119,19 +391,69 @@ namespace DRT
                     destination = destination % safeStopCount + 1;
                 }
 
-                result.Add(new DRTDemandScheduleEntry
+                result.Add(new DRTDemandReplayEntry
                 {
+                    passengerId = 0,
                     requestTimeSeconds = Mathf.Round(i * interval),
                     originStopId = origin,
                     destinationStopId = destination,
-                    passengerCount = 1
+                    passengerCount = 1,
+                    initialStatus = DRTPassengerStatus.Scheduled,
+                    sourceDescription = $"rule:{i + 1}"
                 });
             }
 
             return result;
         }
 
-        private bool IsValidEntry(DRTDemandScheduleEntry entry)
+        private void SpawnAllRequests(bool suppressLog)
+        {
+            int spawned = 0;
+            for (int i = 0; i < replaySchedule.Count; i++)
+            {
+                spawned += SpawnEntry(replaySchedule[i], false);
+            }
+
+            nextReplayIndex = replaySchedule.Count;
+
+            if (spawned > 0 && logSpawnedRequests && !suppressLog)
+            {
+                Debug.Log($"[DEMANDGENERATOR] Spawned all scenario requests={spawned}.");
+            }
+        }
+
+        private int SpawnEntry(DRTDemandReplayEntry entry, bool preserveInitialStatus)
+        {
+            if (entry == null || !EnsurePassengerManager())
+            {
+                return 0;
+            }
+
+            int count = Mathf.Max(1, entry.passengerCount);
+            int spawned = 0;
+            DRTPassengerStatus initialStatus = preserveInitialStatus
+                ? entry.initialStatus
+                : DRTPassengerStatus.Scheduled;
+
+            for (int passenger = 0; passenger < count; passenger++)
+            {
+                int passengerId = entry.passengerId > 0 && count == 1 ? entry.passengerId : 0;
+                var request = new DRTPassengerRequest(
+                    passengerId,
+                    entry.originStopId,
+                    entry.destinationStopId,
+                    entry.requestTimeSeconds,
+                    initialStatus);
+
+                passengerManager.AddRequest(request);
+                spawned++;
+                SpawnedPassengerCount++;
+            }
+
+            return spawned;
+        }
+
+        private bool IsValidEntry(DRTDemandReplayEntry entry)
         {
             if (entry == null)
             {
@@ -140,13 +462,16 @@ namespace DRT
 
             if (entry.originStopId == entry.destinationStopId)
             {
-                Debug.LogWarning($"[DEMANDGENERATOR] Demand ignored. Origin and destination are both Stop {entry.originStopId}.");
+                Debug.LogWarning(
+                    $"[DEMANDGENERATOR] Demand ignored ({entry.sourceDescription}). " +
+                    $"Origin and destination are both Stop {entry.originStopId}.");
                 return false;
             }
 
             if (entry.originStopId < 1 || entry.destinationStopId < 1)
             {
-                Debug.LogWarning("[DEMANDGENERATOR] Demand ignored. Stop IDs must start at 1.");
+                Debug.LogWarning(
+                    $"[DEMANDGENERATOR] Demand ignored ({entry.sourceDescription}). Stop IDs must start at 1.");
                 return false;
             }
 
@@ -158,21 +483,298 @@ namespace DRT
             return true;
         }
 
-        private string FormatFirstRequest()
+        private bool EnsurePassengerManager()
         {
-            if (passengerManager == null || passengerManager.Requests.Count == 0)
+            if (passengerManager == null)
+            {
+                passengerManager = FindObjectOfType<DRTPassengerManager>();
+            }
+
+            if (passengerManager != null)
+            {
+                return true;
+            }
+
+            Debug.LogError("[DRT] Cannot generate demand. PassengerManager is missing.");
+            return false;
+        }
+
+        private int CountPendingPassengers()
+        {
+            if (!HasGenerated || !spawnRequestsAtRequestTime)
+            {
+                return 0;
+            }
+
+            int count = 0;
+            for (int i = nextReplayIndex; i < replaySchedule.Count; i++)
+            {
+                count += Mathf.Max(1, replaySchedule[i].passengerCount);
+            }
+
+            return count;
+        }
+
+        private string FormatFirstScenarioEntry()
+        {
+            if (replaySchedule.Count == 0)
             {
                 return "-";
             }
 
-            var request = passengerManager.Requests[0];
-            return $"#{request.PassengerId}:{request.OriginStopId}->{request.DestinationStopId}@{request.RequestTimeSeconds:0}s";
+            var request = replaySchedule[0];
+            string passengerId = request.passengerId > 0 ? request.passengerId.ToString(CultureInfo.InvariantCulture) : "auto";
+            return $"#{passengerId}:{request.originStopId}->{request.destinationStopId}@{request.requestTimeSeconds:0}s";
+        }
+
+        private string GetSelectedScenarioResourceName()
+        {
+            switch (csvPreset)
+            {
+                case DRTDemandCsvPreset.Scenario18Passengers:
+                    return Scenario18ResourceName;
+                case DRTDemandCsvPreset.Scenario22Passengers:
+                    return Scenario22ResourceName;
+                case DRTDemandCsvPreset.Scenario30Passengers:
+                    return Scenario30ResourceName;
+                case DRTDemandCsvPreset.CustomResourceName:
+                    return NormalizeResourceName(customScenarioResourceName);
+                case DRTDemandCsvPreset.Scenario14Passengers:
+                default:
+                    return Scenario14ResourceName;
+            }
+        }
+
+        private static string NormalizeResourceName(string resourceName)
+        {
+            if (string.IsNullOrWhiteSpace(resourceName))
+            {
+                return Scenario14ResourceName;
+            }
+
+            string normalized = resourceName.Trim().Replace('\\', '/');
+            const string resourcesMarker = "Resources/";
+            int resourcesIndex = normalized.IndexOf(resourcesMarker, StringComparison.OrdinalIgnoreCase);
+            if (resourcesIndex >= 0)
+            {
+                normalized = normalized.Substring(resourcesIndex + resourcesMarker.Length);
+            }
+
+            if (normalized.EndsWith(".csv", StringComparison.OrdinalIgnoreCase))
+            {
+                normalized = normalized.Substring(0, normalized.Length - 4);
+            }
+
+            return normalized;
+        }
+
+        private static DRTPassengerStatus ReadInitialStatus(string[] fields, int statusColumn, int rowNumber)
+        {
+            if (statusColumn < 0 || !TryGetField(fields, statusColumn, out string statusText) || string.IsNullOrWhiteSpace(statusText))
+            {
+                return DRTPassengerStatus.Scheduled;
+            }
+
+            if (!Enum.TryParse(statusText.Trim(), true, out DRTPassengerStatus parsedStatus))
+            {
+                Debug.LogWarning($"[DEMANDGENERATOR] CSV row {rowNumber} has unknown status '{statusText}'. Spawning as Scheduled.");
+                return DRTPassengerStatus.Scheduled;
+            }
+
+            return NormalizeInitialStatus(parsedStatus);
+        }
+
+        private static DRTPassengerStatus NormalizeInitialStatus(DRTPassengerStatus status)
+        {
+            return status == DRTPassengerStatus.Waiting
+                ? DRTPassengerStatus.Waiting
+                : DRTPassengerStatus.Scheduled;
+        }
+
+        private static int CompareReplayEntries(DRTDemandReplayEntry a, DRTDemandReplayEntry b)
+        {
+            if (ReferenceEquals(a, b))
+            {
+                return 0;
+            }
+
+            if (a == null)
+            {
+                return 1;
+            }
+
+            if (b == null)
+            {
+                return -1;
+            }
+
+            int timeCompare = a.requestTimeSeconds.CompareTo(b.requestTimeSeconds);
+            if (timeCompare != 0)
+            {
+                return timeCompare;
+            }
+
+            return a.passengerId.CompareTo(b.passengerId);
+        }
+
+        private static bool TryReadInt(
+            string[] fields,
+            int column,
+            int rowNumber,
+            string columnName,
+            out int value,
+            out string error)
+        {
+            value = 0;
+            error = null;
+            if (!TryGetField(fields, column, out string text) ||
+                !int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out value))
+            {
+                error = $"CSV row {rowNumber} column '{columnName}' is not a valid integer.";
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool TryReadFloat(
+            string[] fields,
+            int column,
+            int rowNumber,
+            string columnName,
+            out float value,
+            out string error)
+        {
+            value = 0f;
+            error = null;
+            if (!TryGetField(fields, column, out string text) ||
+                !float.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value))
+            {
+                error = $"CSV row {rowNumber} column '{columnName}' is not a valid number.";
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool TryGetField(string[] fields, int column, out string value)
+        {
+            value = null;
+            if (fields == null || column < 0 || column >= fields.Length)
+            {
+                return false;
+            }
+
+            value = fields[column].Trim();
+            return true;
+        }
+
+        private static int FindColumn(Dictionary<string, int> columns, params string[] aliases)
+        {
+            for (int i = 0; i < aliases.Length; i++)
+            {
+                string normalizedAlias = NormalizeHeader(aliases[i]);
+                if (columns.TryGetValue(normalizedAlias, out int column))
+                {
+                    return column;
+                }
+            }
+
+            return -1;
+        }
+
+        private static string NormalizeHeader(string header)
+        {
+            if (string.IsNullOrWhiteSpace(header))
+            {
+                return string.Empty;
+            }
+
+            var builder = new StringBuilder();
+            for (int i = 0; i < header.Length; i++)
+            {
+                char c = header[i];
+                if (char.IsLetterOrDigit(c))
+                {
+                    builder.Append(char.ToLowerInvariant(c));
+                }
+            }
+
+            return builder.ToString();
+        }
+
+        private static string[] SplitCsvLine(string line)
+        {
+            var fields = new List<string>();
+            var builder = new StringBuilder();
+            bool inQuotes = false;
+
+            for (int i = 0; i < line.Length; i++)
+            {
+                char c = line[i];
+                if (c == '"')
+                {
+                    if (inQuotes && i + 1 < line.Length && line[i + 1] == '"')
+                    {
+                        builder.Append('"');
+                        i++;
+                    }
+                    else
+                    {
+                        inQuotes = !inQuotes;
+                    }
+
+                    continue;
+                }
+
+                if (c == ',' && !inQuotes)
+                {
+                    fields.Add(builder.ToString());
+                    builder.Length = 0;
+                    continue;
+                }
+
+                builder.Append(c);
+            }
+
+            fields.Add(builder.ToString());
+            return fields.ToArray();
+        }
+
+        private static bool IsEmptyRow(string[] fields)
+        {
+            if (fields == null || fields.Length == 0)
+            {
+                return true;
+            }
+
+            for (int i = 0; i < fields.Length; i++)
+            {
+                if (!string.IsNullOrWhiteSpace(fields[i]))
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         private void OnValidate()
         {
             stopCount = Mathf.Max(2, stopCount);
             episodeLengthSeconds = Mathf.Max(1f, episodeLengthSeconds);
+            customScenarioResourceName = NormalizeResourceName(customScenarioResourceName);
+        }
+
+        private sealed class DRTDemandReplayEntry
+        {
+            public int passengerId;
+            public float requestTimeSeconds;
+            public int originStopId;
+            public int destinationStopId;
+            public int passengerCount;
+            public DRTPassengerStatus initialStatus;
+            public string sourceDescription;
         }
     }
 }
