@@ -35,6 +35,7 @@ namespace DRT
             var debugGui = GetOrAdd<DRTDebugGUI>(systemObject);
 
             demandGenerator.Configure(passengerManager, busStopsRoot.childCount);
+            nextStopSelector.Configure(busController);
             busController.Configure(busStopsRoot, passengerManager, demandGenerator, nextStopSelector, 0, 1);
             debugGui.Configure(passengerManager, busController);
 

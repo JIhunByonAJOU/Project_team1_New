@@ -84,6 +84,12 @@ namespace DRT
                 $"firstRequest={FormatFirstRequest()}");
         }
 
+        public void ResetDemand()
+        {
+            HasGenerated = false;
+            GenerateDemand();
+        }
+
         private List<DRTDemandScheduleEntry> BuildDefaultRuleBasedSchedule()
         {
             var result = new List<DRTDemandScheduleEntry>();

@@ -16,6 +16,7 @@ namespace DRT
         private const int ObservationsPerStop = 8;
 
         [Header("PPO Decision Space")]
+        [SerializeField] private DRTBusController busController;
         [SerializeField, Min(2)] private int maxStops = 16;
         [SerializeField] private bool skipCurrentStop = true;
         [SerializeField] private float episodeLengthSeconds = 3600f;
@@ -49,6 +50,9 @@ namespace DRT
         private bool decisionReady;
         private int selectedStopId = -1;
         private int lastSelectedStopId = -1;
+        private int episodeDecisionCount;
+        private int episodeStopArrivalCount;
+        private float episodeRewardTotal;
 
         public float MaxDecisionWaitSeconds => maxDecisionWaitSeconds;
         public int LastSelectedStopId => lastSelectedStopId;
@@ -63,6 +67,21 @@ namespace DRT
         public override void Initialize()
         {
             ConfigureBehaviorParameters();
+        }
+
+        public void Configure(DRTBusController newBusController)
+        {
+            busController = newBusController;
+        }
+
+        public override void OnEpisodeBegin()
+        {
+            CancelDecision();
+            episodeDecisionCount = 0;
+            episodeStopArrivalCount = 0;
+            episodeRewardTotal = 0f;
+            ResolveBusController();
+            busController?.ResetEpisodeFromAgent();
         }
 
         public bool BeginDecision(
@@ -83,6 +102,11 @@ namespace DRT
             selectedStopId = -1;
             decisionReady = false;
             decisionPending = true;
+            episodeDecisionCount++;
+
+            RecordStat("DRT/DecisionRequested", 1f, StatAggregationMethod.Sum);
+            RecordStat("DRT/EpisodeTimeAtDecision", currentEpisodeTime);
+            RecordStat("DRT/EpisodeDecisionCount", episodeDecisionCount, StatAggregationMethod.MostRecent);
 
             RequestDecision();
             return true;
@@ -116,12 +140,22 @@ namespace DRT
             }
 
             float networkAverageReward = GetNetworkAverageAccessReward();
-            float unboardedPenalty = GetUnboardedPassengerPenalty(currentEpisodeTime, networkAverageReward);
+            float unboardedPenalty = GetUnboardedPassengerPenalty(currentEpisodeTime);
             float boardingReward = GetBoardingReward(result.StopId, currentEpisodeTime, networkAverageReward);
             float dropoffReward = GetDropoffReward(result.StopId, currentEpisodeTime, networkAverageReward);
             float reward = boardingReward + dropoffReward - unboardedPenalty;
 
             AddReward(reward);
+            episodeRewardTotal += reward;
+            episodeStopArrivalCount++;
+
+            RecordStat("DRT/Reward/StopTotal", reward);
+            RecordStat("DRT/Reward/Boarding", boardingReward);
+            RecordStat("DRT/Reward/Dropoff", dropoffReward);
+            RecordStat("DRT/Reward/UnboardedPenalty", unboardedPenalty);
+            RecordStat("DRT/Reward/EpisodeTotal", episodeRewardTotal, StatAggregationMethod.MostRecent);
+            RecordStat("DRT/StopArrivals", 1f, StatAggregationMethod.Sum);
+            RecordStat("DRT/EpisodeStopArrivalCount", episodeStopArrivalCount, StatAggregationMethod.MostRecent);
 
             if (logReward)
             {
@@ -132,10 +166,32 @@ namespace DRT
             }
         }
 
+        public void RecordExternalPenalty(float penalty, string reason)
+        {
+            if (Mathf.Approximately(penalty, 0f))
+            {
+                return;
+            }
+
+            AddReward(penalty);
+            episodeRewardTotal += penalty;
+            RecordStat("DRT/Reward/ExternalPenalty", penalty);
+            RecordStat("DRT/Reward/EpisodeTotal", episodeRewardTotal, StatAggregationMethod.MostRecent);
+
+            if (logReward)
+            {
+                Debug.Log($"[NEXTSTOPSELECTOR] ExternalPenalty reward={penalty:0.000}, reason={reason}");
+            }
+        }
+
         public void NotifyEpisodeFinished(bool completedAllRequests)
         {
-            EndEpisode();
+            RecordStat("DRT/EpisodeDecisionCount", episodeDecisionCount, StatAggregationMethod.MostRecent);
+            RecordStat("DRT/EpisodeStopArrivalCount", episodeStopArrivalCount, StatAggregationMethod.MostRecent);
+            RecordStat("DRT/Reward/EpisodeTotal", episodeRewardTotal, StatAggregationMethod.MostRecent);
+            RecordStat("DRT/EpisodeCompletedAllRequests", completedAllRequests ? 1f : 0f, StatAggregationMethod.MostRecent);
             CancelDecision();
+            EndEpisode();
         }
 
         public override void CollectObservations(VectorSensor sensor)
@@ -221,6 +277,9 @@ namespace DRT
                 if (!Mathf.Approximately(invalidActionPenalty, 0f))
                 {
                     AddReward(invalidActionPenalty);
+                    episodeRewardTotal += invalidActionPenalty;
+                    RecordStat("DRT/Reward/InvalidActionPenalty", invalidActionPenalty);
+                    RecordStat("DRT/Reward/EpisodeTotal", episodeRewardTotal, StatAggregationMethod.MostRecent);
                 }
 
                 selectedStopId = SelectNextStopId(
@@ -399,24 +458,33 @@ namespace DRT
             return 0;
         }
 
-        private float GetUnboardedPassengerPenalty(float currentEpisodeTime, float networkAverageReward)
+        private float GetUnboardedPassengerPenalty(float currentEpisodeTime)
         {
             float penalty = 0f;
-            int stopCount = decisionStops != null ? Mathf.Min(decisionStops.Count, maxStops) : 0;
+            var requests = decisionPassengerManager.Requests;
 
-            for (int i = 0; i < stopCount; i++)
+            for (int i = 0; i < requests.Count; i++)
             {
-                DRTStop stop = decisionStops[i];
-                if (stop == null)
+                var request = requests[i];
+                if (request == null)
                 {
                     continue;
                 }
 
-                int waitingAtStop = decisionPassengerManager.GetWaitingCountAtStop(stop.StopId, currentEpisodeTime);
-                penalty += waitingAtStop * unboardedPassengerPenaltyWeight * networkAverageReward;
+                if (request.Status == DRTPassengerStatus.Waiting)
+                {
+                    penalty += SecondsToMinutes(request.GetWaitTime(currentEpisodeTime));
+                    continue;
+                }
+
+                if (request.Status == DRTPassengerStatus.Scheduled &&
+                    request.RequestTimeSeconds <= currentEpisodeTime)
+                {
+                    penalty += SecondsToMinutes(currentEpisodeTime - request.RequestTimeSeconds);
+                }
             }
 
-            return penalty;
+            return penalty * unboardedPassengerPenaltyWeight;
         }
 
         private float GetBoardingReward(int stopId, float currentEpisodeTime, float networkAverageReward)
@@ -510,6 +578,11 @@ namespace DRT
             return recordedTime >= 0f && Mathf.Abs(recordedTime - currentEpisodeTime) <= 0.05f;
         }
 
+        private static float SecondsToMinutes(float seconds)
+        {
+            return Mathf.Max(0f, seconds) / 60f;
+        }
+
         private void GetStopPassengerTimeFeatures(int stopId, float currentEpisodeTime, out float maxWaitSeconds, out float maxRideSeconds)
         {
             maxWaitSeconds = 0f;
@@ -564,6 +637,28 @@ namespace DRT
             behaviorParameters.BrainParameters.VectorObservationSize = ObservationSize;
             behaviorParameters.BrainParameters.NumStackedVectorObservations = 1;
             behaviorParameters.BrainParameters.ActionSpec = new ActionSpec(0, new[] { maxStops });
+        }
+
+        private static void RecordStat(
+            string name,
+            float value,
+            StatAggregationMethod aggregationMethod = StatAggregationMethod.Average)
+        {
+            Academy.Instance.StatsRecorder.Add(name, value, aggregationMethod);
+        }
+
+        private void ResolveBusController()
+        {
+            if (busController != null)
+            {
+                return;
+            }
+
+            busController = GetComponent<DRTBusController>();
+            if (busController == null)
+            {
+                busController = FindObjectOfType<DRTBusController>();
+            }
         }
 
         private static DRTStop FindStop(IReadOnlyList<DRTStop> stops, int stopId)

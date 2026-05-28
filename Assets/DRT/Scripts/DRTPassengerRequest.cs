@@ -81,6 +81,11 @@ namespace DRT
 
         public float GetElapsedSinceRequest(float currentEpisodeTime)
         {
+            if (dropoffTimeSeconds >= 0f)
+            {
+                return Mathf.Max(0f, dropoffTimeSeconds - requestTimeSeconds);
+            }
+
             return Mathf.Max(0f, currentEpisodeTime - requestTimeSeconds);
         }
 

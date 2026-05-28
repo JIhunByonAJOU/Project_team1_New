@@ -117,14 +117,16 @@ namespace DRT
             float currentTime = busController.EpisodeTimeSeconds;
             GUILayout.Label($"Target Station: Stop {busController.TargetStopId} ({busController.TargetStopObjectName})", headerStyle);
             GUILayout.Label($"Route: Stop {busController.CurrentStopId} -> Stop {busController.TargetStopId}", smallStyle);
-            GUILayout.Label($"Vehicle {busController.VehicleIndex} | last served stop {busController.CurrentStopId}", smallStyle);
+            GUILayout.Label($"Vehicle {busController.ControlledVehicleName} | last served stop {busController.CurrentStopId}", smallStyle);
             GUILayout.Label($"speed={busController.VehicleSpeedMS:0.00}m/s, targetDist={FormatDistance(busController.TargetDistanceMeters)}, arrival<= {busController.ArrivalDistanceMeters:0.00}m, waitingArrival={busController.IsWaitingForArrivalProximity}", smallStyle);
             GUILayout.Label($"traffic={(busController.BackgroundTrafficEnabled ? "on" : "off")}, activeOtherVehicles={busController.ActiveBackgroundVehicleCount}", smallStyle);
             GUILayout.Space(6);
 
             overviewScroll = GUILayout.BeginScrollView(overviewScroll, GUILayout.Height(Mathf.Max(150f, overviewWindow.height - 122f)));
-            GUILayout.Label($"In Vehicle ({passengerManager.GetOnBoardCount()})", headerStyle);
-            DrawRouteOnlyList(passengerManager.Requests.Where(request => request.Status == DRTPassengerStatus.OnBoard));
+            GUILayout.Label($"In Vehicle ({passengerManager.GetOnBoardCount()}/{passengerManager.BusCapacity})", headerStyle);
+            DrawInVehicleList(
+                passengerManager.Requests.Where(request => request.Status == DRTPassengerStatus.OnBoard),
+                currentTime);
 
             GUILayout.Space(8);
             GUILayout.Label("Waiting At Stops", headerStyle);
@@ -245,6 +247,22 @@ namespace DRT
             }
 
             GUILayout.Label(string.Join(", ", routeTexts), cellStyle);
+        }
+
+        private void DrawInVehicleList(IEnumerable<DRTPassengerRequest> requests, float currentTime)
+        {
+            var passengerTexts = requests
+                .OrderBy(request => request.PickupTimeSeconds)
+                .Select(request => $"#{request.PassengerId} {request.OriginStopId}->{request.DestinationStopId} ride {request.GetRideTime(currentTime):0}s")
+                .ToList();
+
+            if (passengerTexts.Count == 0)
+            {
+                GUILayout.Label("-", smallStyle);
+                return;
+            }
+
+            GUILayout.Label(string.Join(", ", passengerTexts), cellStyle);
         }
 
         private string FormatRouteOnly(DRTPassengerRequest request)

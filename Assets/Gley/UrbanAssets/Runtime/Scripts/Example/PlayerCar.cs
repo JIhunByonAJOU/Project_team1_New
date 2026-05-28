@@ -36,6 +36,9 @@ namespace Gley.UrbanSystem
         bool blinkRifgt;
         float realtimeSinceStartup;
         Rigidbody rb;
+        bool externalInputEnabled;
+        float externalSteeringInput;
+        float externalThrottleInput;
 
         IUIInput inputScript;
 
@@ -51,6 +54,20 @@ namespace Gley.UrbanSystem
             lightsComponent = gameObject.GetComponent<VehicleLightsComponent>();
             lightsComponent.Initialize();
             rb = GetComponent<Rigidbody>();
+        }
+
+        public void SetExternalInput(float steering, float throttle, bool enabled)
+        {
+            externalSteeringInput = Mathf.Clamp(steering, -1f, 1f);
+            externalThrottleInput = Mathf.Clamp(throttle, -1f, 1f);
+            externalInputEnabled = enabled;
+        }
+
+        public void ClearExternalInput()
+        {
+            externalInputEnabled = false;
+            externalSteeringInput = 0f;
+            externalThrottleInput = 0f;
         }
 
         // finds the corresponding visual wheel
@@ -74,8 +91,15 @@ namespace Gley.UrbanSystem
 
         public void FixedUpdate()
         {
-            float motor = maxMotorTorque * inputScript.GetVerticalInput();
-            float steering = maxSteeringAngle * inputScript.GetHorizontalInput();
+            float verticalInput = externalInputEnabled
+                ? externalThrottleInput
+                : inputScript != null ? inputScript.GetVerticalInput() : 0f;
+            float horizontalInput = externalInputEnabled
+                ? externalSteeringInput
+                : inputScript != null ? inputScript.GetHorizontalInput() : 0f;
+
+            float motor = maxMotorTorque * verticalInput;
+            float steering = maxSteeringAngle * horizontalInput;
 #if UNITY_6000_0_OR_NEWER
             var velocity = rb.linearVelocity;
 #else
