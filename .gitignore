@@ -63,4 +63,8 @@ ExportedObj/
 /output/
 /tmp/
 
+# ML-Agents generated profiling output
+/[Aa]ssets/ML-Agents/Timers/*_timers.json
+/[Aa]ssets/ML-Agents/Timers/*_timers.json.meta
+
 # Keep imported assets, project settings, packages, .asset, and .meta files tracked.
