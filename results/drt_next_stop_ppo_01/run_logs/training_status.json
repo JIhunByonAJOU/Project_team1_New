@@ -2,22 +2,22 @@
     "DRTNextStopPPO": {
         "checkpoints": [
             {
-                "steps": 27,
-                "file_path": "results\\drt_next_stop_ppo_01\\DRTNextStopPPO\\DRTNextStopPPO-27.onnx",
-                "reward": 43.444000244140625,
-                "creation_time": 1779970772.372801,
+                "steps": 22,
+                "file_path": "results\\drt_next_stop_ppo_01\\DRTNextStopPPO\\DRTNextStopPPO-22.onnx",
+                "reward": -234.5976104736328,
+                "creation_time": 1779971499.3324833,
                 "auxillary_file_paths": [
-                    "results\\drt_next_stop_ppo_01\\DRTNextStopPPO\\DRTNextStopPPO-27.pt"
+                    "results\\drt_next_stop_ppo_01\\DRTNextStopPPO\\DRTNextStopPPO-22.pt"
                 ]
             }
         ],
         "final_checkpoint": {
-            "steps": 27,
+            "steps": 22,
             "file_path": "results\\drt_next_stop_ppo_01\\DRTNextStopPPO.onnx",
-            "reward": 43.444000244140625,
-            "creation_time": 1779970772.372801,
+            "reward": -234.5976104736328,
+            "creation_time": 1779971499.3324833,
             "auxillary_file_paths": [
-                "results\\drt_next_stop_ppo_01\\DRTNextStopPPO\\DRTNextStopPPO-27.pt"
+                "results\\drt_next_stop_ppo_01\\DRTNextStopPPO\\DRTNextStopPPO-22.pt"
             ]
         }
     },
