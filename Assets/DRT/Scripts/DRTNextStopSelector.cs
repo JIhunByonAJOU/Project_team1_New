@@ -185,12 +185,23 @@ namespace DRT
             }
         }
 
-        public void NotifyEpisodeFinished(bool completedAllRequests)
+        public void NotifyEpisodeFinished(
+            bool completedAllRequests,
+            float travelDistanceMeters,
+            float averageWaitSeconds,
+            float averageRideSeconds,
+            float serviceRate,
+            int completedPassengerCount)
         {
             RecordStat("DRT/EpisodeDecisionCount", episodeDecisionCount, StatAggregationMethod.MostRecent);
             RecordStat("DRT/EpisodeStopArrivalCount", episodeStopArrivalCount, StatAggregationMethod.MostRecent);
             RecordStat("DRT/Reward/EpisodeTotal", episodeRewardTotal, StatAggregationMethod.MostRecent);
             RecordStat("DRT/EpisodeCompletedAllRequests", completedAllRequests ? 1f : 0f, StatAggregationMethod.MostRecent);
+            RecordStat("DRT/EpisodeTravelDistanceMeters", travelDistanceMeters, StatAggregationMethod.MostRecent);
+            RecordStat("DRT/EpisodeAverageWaitSeconds", averageWaitSeconds, StatAggregationMethod.MostRecent);
+            RecordStat("DRT/EpisodeAverageRideSeconds", averageRideSeconds, StatAggregationMethod.MostRecent);
+            RecordStat("DRT/EpisodeServiceRate", serviceRate, StatAggregationMethod.MostRecent);
+            RecordStat("DRT/EpisodeCompletedPassengers", completedPassengerCount, StatAggregationMethod.MostRecent);
             CancelDecision();
             EndEpisode();
         }

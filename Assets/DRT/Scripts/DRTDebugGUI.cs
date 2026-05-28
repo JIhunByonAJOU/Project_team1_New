@@ -119,6 +119,7 @@ namespace DRT
             GUILayout.Label($"Route: Stop {busController.CurrentStopId} -> Stop {busController.TargetStopId}", smallStyle);
             GUILayout.Label($"Mode {busController.TravelExecutionModeName} | Vehicle {busController.ControlledVehicleName} | last served stop {busController.CurrentStopId}", smallStyle);
             GUILayout.Label($"speed={busController.VehicleSpeedMS:0.00}m/s, targetDist={FormatDistance(busController.TargetDistanceMeters)}, arrival<= {busController.ArrivalDistanceMeters:0.00}m, waitingArrival={busController.IsWaitingForArrivalProximity}", smallStyle);
+            GUILayout.Label($"episodeDistance={busController.EpisodeTravelDistanceMeters:0.0}m", smallStyle);
             GUILayout.Label($"traffic={(busController.BackgroundTrafficEnabled ? "on" : "off")}, activeOtherVehicles={busController.ActiveBackgroundVehicleCount}", smallStyle);
             GUILayout.Space(6);
 

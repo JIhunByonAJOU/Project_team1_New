@@ -87,6 +87,9 @@ namespace DRT
         private Vector3 lastVehicleMovementPosition;
         private float lastVehicleMovementRealtime;
         private bool hasVehicleMovementSample;
+        private float episodeTravelDistanceMeters;
+        private Vector3 lastTravelDistanceSamplePosition;
+        private bool hasTravelDistanceSample;
         private bool travelTimeMatrixLoadAttempted;
         private int episodeIndex;
 
@@ -102,6 +105,7 @@ namespace DRT
         public float ArrivalDistanceMeters => arrivalDistanceMeters;
         public float VehicleSpeedMS => GetVehicleSpeedMS();
         public float TargetDistanceMeters => GetTargetDistanceMeters();
+        public float EpisodeTravelDistanceMeters => episodeTravelDistanceMeters;
         public string TargetStopObjectName => TryGetStop(targetStopId, out DRTStop stop) ? stop.name : "-";
         public bool BackgroundTrafficEnabled => backgroundTrafficEnabled;
         public int ActiveBackgroundVehicleCount => CountActiveBackgroundTrafficVehicles();
@@ -163,6 +167,8 @@ namespace DRT
             targetStopId = 0;
             nextMovementDiagnosticTime = 0f;
             hasVehicleMovementSample = false;
+            episodeTravelDistanceMeters = 0f;
+            hasTravelDistanceSample = false;
             travelTimeMatrixLoadAttempted = false;
             lastVehicleMovementRealtime = Time.realtimeSinceStartup;
             lastVehicleMovementPosition = Vector3.zero;
@@ -204,6 +210,7 @@ namespace DRT
             }
 
             passengerManager?.UpdateRequestStates(episodeTimeSeconds);
+            TrackPhysicalTravelDistanceIfNeeded();
             LogMovementDiagnosticsIfNeeded();
             if (!UsesMatrixTeleportTraining)
             {
@@ -380,6 +387,7 @@ namespace DRT
             EnsureBackgroundTrafficStateInitialized();
             ApplyBackgroundTrafficState();
             ResetControlledVehicleForEpisode();
+            ResetTravelDistanceSample(GetControlledVehicleBodyPosition());
             if (UsesMatrixTeleportTraining && !EnsureTravelTimeMatrix())
             {
                 initialized = false;
@@ -670,6 +678,7 @@ namespace DRT
             waitingForArrivalProximity = false;
 
             episodeTimeSeconds += travelSeconds;
+            episodeTravelDistanceMeters += travelSeconds * matrixNominalSpeedMetersPerSecond;
             passengerManager?.UpdateRequestStates(episodeTimeSeconds);
             TeleportControlledVehicleToStop(nextStop);
 
@@ -738,6 +747,7 @@ namespace DRT
             playerVehicleDriver.TeleportTo(servicePoint, rotation);
             ApplyCameraFollow(controlledPlayerVehicle);
             ResetLegSafetyState(GetControlledVehicleBodyPosition());
+            ResetTravelDistanceSample(GetControlledVehicleBodyPosition());
         }
 
         private bool TryGetStop(int stopId, out DRTStop stop)
@@ -1151,6 +1161,34 @@ namespace DRT
             lastVehicleMovementPosition = vehiclePosition;
             lastVehicleMovementRealtime = Time.realtimeSinceStartup;
             hasVehicleMovementSample = true;
+        }
+
+        private void ResetTravelDistanceSample(Vector3 vehiclePosition)
+        {
+            lastTravelDistanceSamplePosition = vehiclePosition;
+            hasTravelDistanceSample = true;
+        }
+
+        private void TrackPhysicalTravelDistanceIfNeeded()
+        {
+            if (UsesMatrixTeleportTraining || !initialized || episodeFinished || controlledPlayerVehicle == null)
+            {
+                return;
+            }
+
+            Vector3 bodyPosition = GetControlledVehicleBodyPosition();
+            if (!hasTravelDistanceSample)
+            {
+                ResetTravelDistanceSample(bodyPosition);
+                return;
+            }
+
+            float distance = GetPlanarDistance(lastTravelDistanceSamplePosition, bodyPosition);
+            if (distance > 0.001f)
+            {
+                episodeTravelDistanceMeters += distance;
+                lastTravelDistanceSamplePosition = bodyPosition;
+            }
         }
 
         private void LogMovementDiagnosticsIfNeeded()
