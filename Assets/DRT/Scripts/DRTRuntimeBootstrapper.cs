@@ -1,0 +1,146 @@
+using UnityEngine;
+using Gley.TrafficSystem;
+using Gley.UrbanSystem;
+
+namespace DRT
+{
+    public static class DRTRuntimeBootstrapper
+    {
+        private const string SystemObjectName = "DRTSystem";
+        private const string BusStopsObjectName = "BusStops";
+
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
+        private static void Setup()
+        {
+            Transform busStopsRoot = FindBusStopsRoot();
+            if (busStopsRoot == null)
+            {
+                Debug.LogWarning("[DRT] BusStops object not found. DRT auto setup skipped.");
+                return;
+            }
+
+            DisableGleyTrafficExample();
+            EnsurePathFindingEnabled();
+
+            GameObject systemObject = GameObject.Find(SystemObjectName);
+            if (systemObject == null)
+            {
+                systemObject = new GameObject(SystemObjectName);
+            }
+
+            var passengerManager = GetOrAdd<DRTPassengerManager>(systemObject);
+            var demandGenerator = GetOrAdd<DRTDemandGenerator>(systemObject);
+            var nextStopSelector = GetOrAdd<DRTNextStopSelector>(systemObject);
+            var busController = GetOrAdd<DRTBusController>(systemObject);
+            var debugGui = GetOrAdd<DRTDebugGUI>(systemObject);
+
+            demandGenerator.Configure(passengerManager, busStopsRoot.childCount);
+            busController.Configure(busStopsRoot, passengerManager, demandGenerator, nextStopSelector, 0, 1);
+            debugGui.Configure(passengerManager, busController);
+
+            Debug.Log($"[DRT] Auto setup complete. Stops={busStopsRoot.childCount}");
+        }
+
+        private static void EnsurePathFindingEnabled()
+        {
+            var trafficModules = Object.FindObjectOfType<TrafficModules>();
+            var trafficWaypointsData = Object.FindObjectOfType<TrafficWaypointsData>();
+
+            if (trafficModules == null || trafficWaypointsData == null)
+            {
+                Debug.LogWarning("[DRT] TrafficModules or TrafficWaypointsData not found. Path Finding setup skipped.");
+                return;
+            }
+
+            trafficModules.SetModules(true);
+
+            var pathFindingData = trafficWaypointsData.GetComponent<PathFindingData>();
+            if (pathFindingData == null)
+            {
+                pathFindingData = trafficWaypointsData.gameObject.AddComponent<PathFindingData>();
+            }
+
+            var trafficWaypoints = trafficWaypointsData.AllTrafficWaypoints;
+            if (trafficWaypoints == null || trafficWaypoints.Length == 0)
+            {
+                Debug.LogWarning("[DRT] Traffic waypoints missing. Path Finding data cannot be generated.");
+                return;
+            }
+
+            var pathFindingWaypoints = new PathFindingWaypoint[trafficWaypoints.Length];
+            for (int i = 0; i < trafficWaypoints.Length; i++)
+            {
+                var waypoint = trafficWaypoints[i];
+                int[] allowedAgents = new int[waypoint.AllowedVehicles.Length];
+                for (int agentIndex = 0; agentIndex < waypoint.AllowedVehicles.Length; agentIndex++)
+                {
+                    allowedAgents[agentIndex] = (int)waypoint.AllowedVehicles[agentIndex];
+                }
+
+                pathFindingWaypoints[i] = new PathFindingWaypoint(
+                    waypoint.ListIndex,
+                    waypoint.Position,
+                    0,
+                    0,
+                    -1,
+                    waypoint.Neighbors,
+                    new int[waypoint.Neighbors.Length],
+                    allowedAgents);
+            }
+
+            pathFindingData.SetPathFindingWaypoints(pathFindingWaypoints);
+            Debug.Log($"[DRT] Runtime Path Finding enabled. Waypoints={pathFindingWaypoints.Length}");
+        }
+
+        private static Transform FindBusStopsRoot()
+        {
+            GameObject exactMatch = GameObject.Find(BusStopsObjectName);
+            if (exactMatch != null)
+            {
+                return exactMatch.transform;
+            }
+
+            var allTransforms = Object.FindObjectsOfType<Transform>();
+            for (int i = 0; i < allTransforms.Length; i++)
+            {
+                if (allTransforms[i].name.ToLowerInvariant().Contains("busstop"))
+                {
+                    return allTransforms[i];
+                }
+            }
+
+            return null;
+        }
+
+        private static void DisableGleyTrafficExample()
+        {
+            var behaviours = Object.FindObjectsOfType<MonoBehaviour>();
+            for (int i = 0; i < behaviours.Length; i++)
+            {
+                var behaviour = behaviours[i];
+                if (behaviour == null)
+                {
+                    continue;
+                }
+
+                var typeName = behaviour.GetType().FullName;
+                if (typeName == "Gley.TrafficSystem.Internal.TrafficExample")
+                {
+                    behaviour.enabled = false;
+                    Debug.Log("[DRT] Disabled Gley TrafficExample to avoid duplicate vehicle control.");
+                }
+            }
+        }
+
+        private static T GetOrAdd<T>(GameObject gameObject) where T : Component
+        {
+            var component = gameObject.GetComponent<T>();
+            if (component == null)
+            {
+                component = gameObject.AddComponent<T>();
+            }
+
+            return component;
+        }
+    }
+}

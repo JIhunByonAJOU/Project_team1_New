@@ -167,7 +167,7 @@ namespace Gley.TrafficSystem
         {
             if (Application.isPlaying)
             {
-                if (_initialized)
+                if (_initialized && API.IsInitialized())
                 {
                     if (TrafficManager.Instance.DebugManager.IsDebugWaypointsEnabled())
                     {

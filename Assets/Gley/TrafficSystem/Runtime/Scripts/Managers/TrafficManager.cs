@@ -1503,9 +1503,9 @@ namespace Gley.TrafficSystem
 #if UNITY_EDITOR
         private void OnDrawGizmos()
         {
-            if (!_initialized)
+            if (!_initialized || _debugManager == null)
                 return;
-            DebugManager.DrawGizmos();
+            _debugManager.DrawGizmos();
         }
 #endif
     }
