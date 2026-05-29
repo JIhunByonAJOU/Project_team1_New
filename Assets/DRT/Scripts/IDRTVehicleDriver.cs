@@ -11,6 +11,8 @@ namespace DRT
         int PathPointCount { get; }
         int RemainingPathPointCount { get; }
         Vector3 BodyPosition { get; }
+        bool IsTemporarilyBlocked { get; }
+        string TemporaryBlockReason { get; }
 
         bool SetPath(List<int> waypointIndexes, Vector3 destination);
         void StopAndHold(bool zeroVelocity);

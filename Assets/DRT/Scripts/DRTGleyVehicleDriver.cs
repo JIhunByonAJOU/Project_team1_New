@@ -11,6 +11,7 @@ namespace DRT
     {
         [SerializeField] private int vehicleIndex;
         [SerializeField] private VehicleTypes vehicleType = VehicleTypes.Car;
+        [SerializeField] private float speedMultiplier = 1f;
 
         private VehicleComponent vehicleComponent;
 
@@ -18,9 +19,12 @@ namespace DRT
         public string VehicleName => vehicleComponent != null ? vehicleComponent.name : $"GleyVehicle[{vehicleIndex}]";
         public int VehicleIndex => vehicleIndex;
         public VehicleTypes VehicleType => vehicleType;
+        public float SpeedMultiplier => speedMultiplier;
         public int PathPointCount => vehicleComponent != null ? vehicleComponent.MovementInfo.PathLength : 0;
         public int RemainingPathPointCount => vehicleComponent != null ? vehicleComponent.MovementInfo.RemainingPathLength : 0;
         public Vector3 BodyPosition => GetBodyPosition();
+        public bool IsTemporarilyBlocked => TryGetTemporaryBlockReason(out _);
+        public string TemporaryBlockReason => TryGetTemporaryBlockReason(out string reason) ? reason : string.Empty;
 
         public float CurrentSpeedMS
         {
@@ -32,11 +36,13 @@ namespace DRT
             }
         }
 
-        public void Configure(int newVehicleIndex, VehicleTypes newVehicleType)
+        public void Configure(int newVehicleIndex, VehicleTypes newVehicleType, float newSpeedMultiplier = 1f)
         {
             vehicleIndex = Mathf.Max(0, newVehicleIndex);
             vehicleType = newVehicleType;
+            speedMultiplier = Mathf.Clamp(newSpeedMultiplier, 0.1f, 2f);
             ResolveVehicleComponent(false);
+            ApplySpeedMultiplier();
         }
 
         public bool SetPath(List<int> waypointIndexes, Vector3 destination)
@@ -46,6 +52,7 @@ namespace DRT
                 return false;
             }
 
+            ApplySpeedMultiplier();
             API.DontRemoveVehicle(vehicleIndex, true);
             API.ResumeVehicleDriving(vehicleComponent.gameObject);
             API.SetVehiclePath(vehicleIndex, waypointIndexes);
@@ -99,7 +106,50 @@ namespace DRT
             if (vehicleComponent != null)
             {
                 vehicleComponent.SetVelocity(Vector3.zero, Vector3.zero);
+                ApplySpeedMultiplier();
             }
+        }
+
+        private void ApplySpeedMultiplier()
+        {
+            if (vehicleComponent == null || vehicleComponent.MovementInfo == null)
+            {
+                return;
+            }
+
+            float multiplier = Mathf.Clamp(speedMultiplier, 0.1f, 2f);
+            vehicleComponent.MovementInfo.SetSpeedVariationPercent(1f - multiplier, multiplier - 1f);
+            vehicleComponent.MovementInfo.SetMaxVehicleSpeed(vehicleComponent.MaxSpeed * multiplier);
+        }
+
+        private bool TryGetTemporaryBlockReason(out string reason)
+        {
+            reason = string.Empty;
+            if (!ResolveVehicleComponent(false) || vehicleComponent == null || vehicleComponent.MovementInfo == null)
+            {
+                return false;
+            }
+
+            var movementInfo = vehicleComponent.MovementInfo;
+            if (movementInfo.HasStopWaypoints())
+            {
+                reason = "traffic stop or signal";
+                return true;
+            }
+
+            if (movementInfo.HasGiveWayWaypoints())
+            {
+                reason = "give-way rule";
+                return true;
+            }
+
+            if (movementInfo.HasObstacles())
+            {
+                reason = "obstacle";
+                return true;
+            }
+
+            return false;
         }
 
         private bool ResolveVehicleComponent(bool logIfMissing)

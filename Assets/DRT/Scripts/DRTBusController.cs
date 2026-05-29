@@ -1,10 +1,14 @@
+using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text;
 using Gley.TrafficSystem;
 using Gley.UrbanSystem;
 using Unity.Barracuda;
+using Unity.MLAgents;
 using Unity.MLAgents.Policies;
 using UnityEngine;
 
@@ -35,6 +39,8 @@ namespace DRT
         [SerializeField] private float stopWaypointSnapDistanceMeters = 5f;
         [SerializeField] private float arrivalWaitTimeoutSeconds = 12f;
         [SerializeField] private float controlledVehicleSpeedMultiplier = 1.5f;
+        [Tooltip("Only used when PhysicalDrive uses the Gley vehicle driver. 1.0 keeps Gley speed unchanged; 1.12 means roughly +12%.")]
+        [SerializeField] private float gleyControlledVehicleSpeedMultiplier = 1.12f;
         [SerializeField] private float playerWaypointReachDistanceMeters = 6f;
         [SerializeField] private bool autoFollowControlledVehicle = true;
         [SerializeField] private bool useGleyVehicleControlInPhysicalDrive = true;
@@ -56,9 +62,23 @@ namespace DRT
         [SerializeField] private NNModel physicalDriveInferenceModel;
         [SerializeField] private InferenceDevice physicalDriveInferenceDevice = InferenceDevice.Default;
 
+        [Header("Inference CSV Export")]
+        [SerializeField] private bool exportInferenceCsvOnEpisodeEnd = true;
+        [SerializeField] private float vehicleTraceSampleIntervalSeconds = 1f;
+
         [Header("Diagnostics")]
         [SerializeField] private bool logMovementDiagnostics;
         [SerializeField] private float movementDiagnosticsIntervalSeconds = 2f;
+
+        [Header("Path Visualization")]
+        [SerializeField] private bool showAssignedPath = true;
+        [SerializeField] private bool showAssignedPathInGame = true;
+        [SerializeField] private bool showAssignedPathGizmos = true;
+        [SerializeField] private Color assignedPathColor = new Color(0f, 0.85f, 1f, 0.9f);
+        [SerializeField] private Color assignedPathWaypointColor = new Color(1f, 0.85f, 0f, 0.95f);
+        [SerializeField] private float assignedPathLineWidth = 0.7f;
+        [SerializeField] private float assignedPathWaypointRadius = 1.2f;
+        [SerializeField] private float assignedPathVerticalOffset = 0.35f;
 
         [Header("Background Traffic")]
         [SerializeField] private bool backgroundTrafficEnabledOnStart = true;
@@ -74,6 +94,8 @@ namespace DRT
         [SerializeField] private bool failEpisodeOnVehicleFault = true;
         [SerializeField] private float failurePenalty = -1f;
         [SerializeField] private float noMovementTimeoutRealSeconds = 20f;
+        [Tooltip("A longer timeout used only when Gley reports a normal stop caused by traffic lights, give-way, or obstacles. Set 0 to never fail on traffic waits.")]
+        [SerializeField] private float trafficBlockTimeoutRealSeconds = 180f;
         [SerializeField] private float minimumVehicleMovementMeters = 1f;
         [SerializeField] private float maxRoadWaypointDistanceMeters = 30f;
         [SerializeField] private float fallYThreshold = -10f;
@@ -95,10 +117,21 @@ namespace DRT
         private int targetStopId;
         private Coroutine dwellRoutine;
         private Coroutine decisionRoutine;
+        private readonly List<Vector3> assignedPathPoints = new List<Vector3>();
+        private LineRenderer assignedPathLineRenderer;
+        private float assignedPathDistanceMeters;
+        private readonly List<DRTRouteLegRecord> routeLegRecords = new List<DRTRouteLegRecord>();
+        private readonly List<DRTVehicleTraceRecord> vehicleTraceRecords = new List<DRTVehicleTraceRecord>();
+        private DRTRouteLegRecord activeRouteLeg;
+        private float nextVehicleTraceSampleTime;
+        private bool inferenceCsvExported;
         private float nextMovementDiagnosticTime;
         private Vector3 lastVehicleMovementPosition;
         private float lastVehicleMovementRealtime;
         private bool hasVehicleMovementSample;
+        private float trafficBlockStartRealtime;
+        private bool hasTrafficBlockSample;
+        private string trafficBlockReason;
         private float episodeTravelDistanceMeters;
         private Vector3 lastTravelDistanceSamplePosition;
         private bool hasTravelDistanceSample;
@@ -114,6 +147,11 @@ namespace DRT
         public int TargetStopId => targetStopId;
         public int VehicleIndex => vehicleIndex;
         public string ControlledVehicleName => vehicleDriver != null ? vehicleDriver.VehicleName : controlledPlayerVehicle != null ? controlledPlayerVehicle.name : "-";
+        public string ControlledDriverName => vehicleDriver != null ? vehicleDriver.GetType().Name : UsesGleyVehicleControl ? nameof(DRTGleyVehicleDriver) : nameof(DRTPlayerVehicleDriver);
+        public int AssignedPathPointCount => assignedPathPoints.Count;
+        public float AssignedPathDistanceMeters => assignedPathDistanceMeters;
+        public bool IsVehicleTemporarilyBlocked => vehicleDriver != null && vehicleDriver.IsTemporarilyBlocked;
+        public string TemporaryBlockReason => vehicleDriver != null ? vehicleDriver.TemporaryBlockReason : string.Empty;
         public float ArrivalDistanceMeters => arrivalDistanceMeters;
         public float VehicleSpeedMS => GetVehicleSpeedMS();
         public float TargetDistanceMeters => GetTargetDistanceMeters();
@@ -178,8 +216,12 @@ namespace DRT
             waitingForArrivalProximity = false;
             currentStopId = startStopId;
             targetStopId = 0;
+            ClearAssignedPathVisualization();
+            ResetInferenceExportState();
             nextMovementDiagnosticTime = 0f;
             hasVehicleMovementSample = false;
+            hasTrafficBlockSample = false;
+            trafficBlockReason = string.Empty;
             episodeTravelDistanceMeters = 0f;
             hasTravelDistanceSample = false;
             travelTimeMatrixLoadAttempted = false;
@@ -225,6 +267,7 @@ namespace DRT
             AdvanceDemandToCurrentTime();
             passengerManager?.UpdateRequestStates(episodeTimeSeconds);
             TrackPhysicalTravelDistanceIfNeeded();
+            RecordVehicleTraceIfNeeded();
             LogMovementDiagnosticsIfNeeded();
             if (!UsesMatrixTeleportTraining)
             {
@@ -236,7 +279,7 @@ namespace DRT
                 return;
             }
 
-            if (episodeTimeSeconds >= episodeLengthSeconds && passengerManager != null && passengerManager.GetOnBoardCount() == 0)
+            if (episodeTimeSeconds >= episodeLengthSeconds && !HasUnfinishedOrPendingRequests())
             {
                 FinishEpisode("Episode time ended.");
             }
@@ -245,6 +288,7 @@ namespace DRT
         private void OnDisable()
         {
             vehicleDriver?.ReleaseControl();
+            ClearAssignedPathVisualization();
         }
 
         [ContextMenu("Reload Stops")]
@@ -387,7 +431,7 @@ namespace DRT
                 }
             }
 
-            gleyVehicleDriver.Configure(vehicleIndex, controlledVehicleType);
+            gleyVehicleDriver.Configure(vehicleIndex, controlledVehicleType, gleyControlledVehicleSpeedMultiplier);
             if (gleyVehicleDriver.VehicleTransform == null)
             {
                 if (logIfMissing)
@@ -483,6 +527,7 @@ namespace DRT
             ApplyBackgroundTrafficState();
             ResetControlledVehicleForEpisode();
             ResetTravelDistanceSample(GetControlledVehicleBodyPosition());
+            RecordVehicleTrace("episode_start");
             if (UsesMatrixTeleportTraining && !EnsureTravelTimeMatrix())
             {
                 initialized = false;
@@ -491,8 +536,10 @@ namespace DRT
 
             ApplyCameraFollow(GetControlledVehicleTransform());
             LogInfo(
-                $"[BUSCONTROLLER] Initialized playerVehicle={ControlledVehicleName}, " +
-                $"mode={TravelExecutionModeName}, firstTargetHint={startStopId}");
+                $"[BUSCONTROLLER] Initialized mode={TravelExecutionModeName}, " +
+                $"driver={ControlledDriverName}, vehicle={ControlledVehicleName}, " +
+                $"gleyControl={UsesGleyVehicleControl}, gleySpeedMultiplier={gleyControlledVehicleSpeedMultiplier:0.00}, " +
+                $"firstTargetHint={startStopId}");
             SendToNextStop();
         }
 
@@ -638,10 +685,12 @@ namespace DRT
                 if (Time.time - waitStartTime >= arrivalWaitTimeoutSeconds)
                 {
                     Debug.LogWarning(
-                        $"[BUSCONTROLLER] Player vehicle arrived for Stop {reachedStopId}, " +
+                        $"[BUSCONTROLLER] Controlled vehicle arrived for Stop {reachedStopId}, " +
                         $"but vehicle-stop distance is {FormatMeters(distance)} > {arrivalDistanceMeters:0.00}m. " +
                         "Boarding/dropoff skipped. Move the BusStop closer to the road waypoint or increase the arrival threshold.");
                     waitingForArrivalProximity = false;
+                    CompleteActiveRouteLeg(reachedStopId, null);
+                    RecordVehicleTrace("arrival_timeout");
                     currentStopId = reachedStopId;
                     yield return new WaitForSeconds(dwellSeconds);
                     SendToNextStop();
@@ -751,8 +800,9 @@ namespace DRT
             if (path == null || path.Count == 0)
             {
                 driving = false;
+                ClearAssignedPathVisualization();
                 Debug.LogWarning(
-                    $"[BUSCONTROLLER] PathAssignmentSkipped playerVehicle={ControlledVehicleName}, candidateStop={nextStop.StopId}, " +
+                    $"[BUSCONTROLLER] PathAssignmentSkipped driver={ControlledDriverName}, vehicle={ControlledVehicleName}, candidateStop={nextStop.StopId}, " +
                     $"candidateObject={nextStop.name}, routeStartWaypoint={routeStartWaypointIndex}. " +
                     "Check that this BusStop is close to a Gley traffic waypoint and allowed for this vehicle type.");
                 FinishFailedEpisode($"Path assignment failed. Requested Stop={nextStop.StopId}");
@@ -762,12 +812,15 @@ namespace DRT
             if (vehicleDriver == null || !vehicleDriver.SetPath(path, servicePoint))
             {
                 driving = false;
-                FinishFailedEpisode($"Player path assignment failed. Requested Stop={nextStop.StopId}");
+                ClearAssignedPathVisualization();
+                FinishFailedEpisode($"Controlled vehicle path assignment failed. Requested Stop={nextStop.StopId}");
                 yield break;
             }
 
             targetStopId = nextStop.StopId;
             driving = true;
+            UpdateAssignedPathVisualization(routeStartPoint, path, servicePoint);
+            BeginRouteLeg(nextStop.StopId, path.Count, assignedPathDistanceMeters);
             ResetLegSafetyState(GetControlledVehicleBodyPosition());
             LogPathAssignment(nextStop, servicePoint, path, routeStartWaypointIndex);
         }
@@ -859,12 +912,14 @@ namespace DRT
             targetStopId = nextStop.StopId;
             driving = false;
             waitingForArrivalProximity = false;
+            BeginRouteLeg(nextStop.StopId, 0, travelSeconds * matrixNominalSpeedMetersPerSecond);
 
             episodeTimeSeconds += travelSeconds;
             episodeTravelDistanceMeters += travelSeconds * matrixNominalSpeedMetersPerSecond;
             AdvanceDemandToCurrentTime();
             passengerManager?.UpdateRequestStates(episodeTimeSeconds);
             TeleportControlledVehicleToStop(nextStop);
+            RecordVehicleTrace("matrix_arrival");
 
             if (logMatrixTravel && !SuppressUnityLogsDuringMatrixTraining)
             {
@@ -897,6 +952,7 @@ namespace DRT
                 currentStopId,
                 episodeTimeSeconds,
                 SuppressUnityLogsDuringMatrixTraining);
+            CompleteActiveRouteLeg(currentStopId, stopResult);
             nextStopSelector.RecordStopArrival(stopResult, episodeTimeSeconds);
 
             if (stopWhenAllRequestsCompleted && !HasUnfinishedOrPendingRequests())
@@ -905,7 +961,7 @@ namespace DRT
                 return true;
             }
 
-            if (episodeTimeSeconds >= episodeLengthSeconds && passengerManager.GetOnBoardCount() == 0)
+            if (episodeTimeSeconds >= episodeLengthSeconds && !HasUnfinishedOrPendingRequests())
             {
                 FinishEpisode("Episode time ended.");
                 return true;
@@ -925,6 +981,71 @@ namespace DRT
                                          passengerManager.HasUnfinishedRequests(episodeTimeSeconds);
             bool hasPendingScenarioDemand = demandGenerator != null && demandGenerator.HasPendingDemand;
             return hasUnfinishedRequests || hasPendingScenarioDemand;
+        }
+
+        private void BeginRouteLeg(int nextStopId, int pathWaypointCount, float plannedPathDistanceMeters)
+        {
+            if (!ShouldCollectInferenceExportData())
+            {
+                return;
+            }
+
+            if (activeRouteLeg != null)
+            {
+                CompleteActiveRouteLeg(-1, null);
+            }
+
+            activeRouteLeg = new DRTRouteLegRecord
+            {
+                LegIndex = routeLegRecords.Count + 1,
+                Mode = GetInferenceExportModeToken(),
+                FromStopId = currentStopId > 0 ? currentStopId : startStopId,
+                ToStopId = nextStopId,
+                ArrivedStopId = -1,
+                DepartureTimeSeconds = episodeTimeSeconds,
+                DepartureCumulativeDistanceMeters = episodeTravelDistanceMeters,
+                PlannedPathDistanceMeters = Mathf.Max(0f, plannedPathDistanceMeters),
+                PathWaypointCount = Mathf.Max(0, pathWaypointCount)
+            };
+        }
+
+        private void CompleteActiveRouteLeg(int reachedStopId, DRTStopProcessResult? stopResult)
+        {
+            if (activeRouteLeg == null)
+            {
+                return;
+            }
+
+            activeRouteLeg.ArrivedStopId = reachedStopId;
+            activeRouteLeg.ArrivalTimeSeconds = episodeTimeSeconds;
+            activeRouteLeg.ArrivalCumulativeDistanceMeters = episodeTravelDistanceMeters;
+            activeRouteLeg.TravelTimeSeconds = Mathf.Max(0f, activeRouteLeg.ArrivalTimeSeconds - activeRouteLeg.DepartureTimeSeconds);
+            activeRouteLeg.LegDistanceMeters = Mathf.Max(0f, activeRouteLeg.ArrivalCumulativeDistanceMeters - activeRouteLeg.DepartureCumulativeDistanceMeters);
+            activeRouteLeg.Completed = stopResult.HasValue && reachedStopId == activeRouteLeg.ToStopId;
+
+            if (stopResult.HasValue)
+            {
+                DRTStopProcessResult result = stopResult.Value;
+                activeRouteLeg.BoardedCount = result.BoardedCount;
+                activeRouteLeg.DroppedOffCount = result.DroppedOffCount;
+                activeRouteLeg.WaitingCount = result.WaitingCount;
+                activeRouteLeg.OnBoardCount = result.OnBoardCount;
+                activeRouteLeg.CompletedPassengerCount = result.CompletedCount;
+            }
+
+            routeLegRecords.Add(activeRouteLeg);
+            string traceEvent = activeRouteLeg.Completed ? "stop_arrival" : "leg_incomplete";
+            activeRouteLeg = null;
+            RecordVehicleTrace(traceEvent);
+        }
+
+        private void ResetInferenceExportState()
+        {
+            routeLegRecords.Clear();
+            vehicleTraceRecords.Clear();
+            activeRouteLeg = null;
+            nextVehicleTraceSampleTime = 0f;
+            inferenceCsvExported = false;
         }
 
         private void TeleportControlledVehicleToStop(DRTStop stop)
@@ -1233,12 +1354,126 @@ namespace DRT
             int directedWaypoint = directedPlayerWaypoint != null ? directedPlayerWaypoint.ListIndex : -1;
 
             Debug.Log(
-                $"[BUSCONTROLLER] RouteRequest playerVehicle={ControlledVehicleName}, currentWaypoint={currentWaypoint}, " +
+                $"[BUSCONTROLLER] RouteRequest driver={ControlledDriverName}, vehicle={ControlledVehicleName}, currentWaypoint={currentWaypoint}, " +
                 $"directedWaypoint={directedWaypoint}, " +
                 $"targetStop={stop.StopId}, targetObject={stop.name}, bodyToService={FormatMeters(bodyToServiceDistance)}, " +
                 $"bodyToStopMarker={FormatMeters(bodyToStopDistance)}, " +
                 $"servicePoint={FormatVector(servicePoint)}, stopMarker={FormatVector(stop.Position)}, " +
                 $"stopToClosestWaypoint={FormatMeters(stopToWaypointDistance)}");
+        }
+
+        private void UpdateAssignedPathVisualization(Vector3 routeStartPoint, List<int> path, Vector3 servicePoint)
+        {
+            assignedPathPoints.Clear();
+            assignedPathDistanceMeters = 0f;
+
+            if (path == null || path.Count == 0)
+            {
+                ApplyAssignedPathLineRenderer();
+                return;
+            }
+
+            assignedPathPoints.Add(OffsetAssignedPathPoint(routeStartPoint));
+
+            for (int i = 0; i < path.Count; i++)
+            {
+                var waypoint = API.GetWaypointFromIndex(path[i]);
+                if (waypoint != null)
+                {
+                    assignedPathPoints.Add(OffsetAssignedPathPoint(waypoint.Position));
+                }
+            }
+
+            assignedPathPoints.Add(OffsetAssignedPathPoint(servicePoint));
+            assignedPathDistanceMeters = CalculateAssignedPathDistanceMeters();
+            ApplyAssignedPathLineRenderer();
+        }
+
+        private void ClearAssignedPathVisualization()
+        {
+            assignedPathPoints.Clear();
+            assignedPathDistanceMeters = 0f;
+            ApplyAssignedPathLineRenderer();
+        }
+
+        private Vector3 OffsetAssignedPathPoint(Vector3 point)
+        {
+            point.y += assignedPathVerticalOffset;
+            return point;
+        }
+
+        private float CalculateAssignedPathDistanceMeters()
+        {
+            if (assignedPathPoints.Count < 2)
+            {
+                return 0f;
+            }
+
+            float distance = 0f;
+            for (int i = 1; i < assignedPathPoints.Count; i++)
+            {
+                distance += GetPlanarDistance(assignedPathPoints[i - 1], assignedPathPoints[i]);
+            }
+
+            return distance;
+        }
+
+        private void EnsureAssignedPathLineRenderer()
+        {
+            if (assignedPathLineRenderer != null)
+            {
+                return;
+            }
+
+            GameObject lineObject = new GameObject("DRT Assigned Path");
+            lineObject.transform.SetParent(transform, false);
+
+            assignedPathLineRenderer = lineObject.AddComponent<LineRenderer>();
+            assignedPathLineRenderer.useWorldSpace = true;
+            assignedPathLineRenderer.alignment = LineAlignment.View;
+            assignedPathLineRenderer.textureMode = LineTextureMode.Tile;
+            assignedPathLineRenderer.numCapVertices = 4;
+            assignedPathLineRenderer.numCornerVertices = 4;
+            assignedPathLineRenderer.enabled = false;
+
+            Shader shader = Shader.Find("Sprites/Default");
+            if (shader == null)
+            {
+                shader = Shader.Find("Unlit/Color");
+            }
+
+            if (shader != null)
+            {
+                assignedPathLineRenderer.material = new Material(shader);
+            }
+        }
+
+        private void ApplyAssignedPathLineRenderer()
+        {
+            if (!showAssignedPath || !showAssignedPathInGame || assignedPathPoints.Count < 2)
+            {
+                if (assignedPathLineRenderer != null)
+                {
+                    assignedPathLineRenderer.positionCount = 0;
+                    assignedPathLineRenderer.enabled = false;
+                }
+
+                return;
+            }
+
+            EnsureAssignedPathLineRenderer();
+            assignedPathLineRenderer.enabled = true;
+            assignedPathLineRenderer.startWidth = assignedPathLineWidth;
+            assignedPathLineRenderer.endWidth = assignedPathLineWidth;
+            assignedPathLineRenderer.startColor = assignedPathColor;
+            assignedPathLineRenderer.endColor = assignedPathColor;
+            if (assignedPathLineRenderer.material != null)
+            {
+                assignedPathLineRenderer.material.color = assignedPathColor;
+            }
+
+            assignedPathLineRenderer.positionCount = assignedPathPoints.Count;
+            assignedPathLineRenderer.SetPositions(assignedPathPoints.ToArray());
         }
 
         private void LogPathAssignment(DRTStop targetStop, Vector3 servicePoint, List<int> path, int routeStartWaypointIndex)
@@ -1249,9 +1484,9 @@ namespace DRT
             string pathPreview = BuildPathPreview(path, 12);
 
             string message =
-                $"[BUSCONTROLLER] PathAssigned integrity={integrity}, playerVehicle={ControlledVehicleName}, " +
+                $"[BUSCONTROLLER] PathAssigned integrity={integrity}, driver={ControlledDriverName}, vehicle={ControlledVehicleName}, " +
                 $"targetStop={targetStop.StopId}, targetObject={targetStop.name}, routeStartWaypoint={routeStartWaypointIndex}, " +
-                $"pathWaypoints={path.Count}, servicePoint={FormatVector(servicePoint)}, {endpointDescription}, " +
+                $"pathWaypoints={path.Count}, visualPathDistance={FormatMeters(assignedPathDistanceMeters)}, servicePoint={FormatVector(servicePoint)}, {endpointDescription}, " +
                 $"pathPreview=[{pathPreview}]";
 
             if (integrity == "warning")
@@ -1324,20 +1559,20 @@ namespace DRT
 
             if (!ResolveControlledVehicle(true) || vehicleDriver == null || vehicleDriver.VehicleTransform == null || !vehicleDriver.VehicleTransform.gameObject.activeSelf)
             {
-                FinishFailedEpisode("Player vehicle is missing or inactive.");
+                FinishFailedEpisode("Controlled vehicle is missing or inactive.");
                 return;
             }
 
             Vector3 bodyPosition = GetControlledVehicleBodyPosition();
             if (bodyPosition.y <= fallYThreshold)
             {
-                FinishFailedEpisode($"Player vehicle fell below safety Y threshold. y={bodyPosition.y:0.00}");
+                FinishFailedEpisode($"Controlled vehicle fell below safety Y threshold. y={bodyPosition.y:0.00}");
                 return;
             }
 
             if (IsTooFarFromTrafficWaypoint(bodyPosition, out float waypointDistance))
             {
-                FinishFailedEpisode($"Player vehicle left traffic network. nearestWaypointDistance={FormatMeters(waypointDistance)}");
+                FinishFailedEpisode($"Controlled vehicle left traffic network. nearestWaypointDistance={FormatMeters(waypointDistance)}");
                 return;
             }
 
@@ -1369,11 +1604,46 @@ namespace DRT
                 return;
             }
 
+            if (vehicleDriver.IsTemporarilyBlocked)
+            {
+                TrackTrafficBlockWait(bodyPosition, targetDistance, movedDistance, vehicleDriver.TemporaryBlockReason);
+                return;
+            }
+
             float stillSeconds = Time.realtimeSinceStartup - lastVehicleMovementRealtime;
             if (stillSeconds >= noMovementTimeoutRealSeconds)
             {
                 FinishFailedEpisode(
-                    $"Player vehicle body unchanged for {noMovementTimeoutRealSeconds:0.0}s real time. " +
+                    $"Controlled vehicle body unchanged for {noMovementTimeoutRealSeconds:0.0}s real time. " +
+                    $"targetStop={targetStopId}, moved={FormatMeters(movedDistance)}, " +
+                    $"distance={FormatMeters(targetDistance)}, speed={GetVehicleSpeedMS():0.00}m/s");
+            }
+        }
+
+        private void TrackTrafficBlockWait(Vector3 bodyPosition, float targetDistance, float movedDistance, string reason)
+        {
+            string currentReason = string.IsNullOrWhiteSpace(reason) ? "traffic wait" : reason;
+            if (!hasTrafficBlockSample || trafficBlockReason != currentReason)
+            {
+                hasTrafficBlockSample = true;
+                trafficBlockStartRealtime = Time.realtimeSinceStartup;
+                trafficBlockReason = currentReason;
+            }
+
+            lastVehicleMovementPosition = bodyPosition;
+            lastVehicleMovementRealtime = Time.realtimeSinceStartup;
+            hasVehicleMovementSample = true;
+
+            if (trafficBlockTimeoutRealSeconds <= 0f)
+            {
+                return;
+            }
+
+            float blockedSeconds = Time.realtimeSinceStartup - trafficBlockStartRealtime;
+            if (blockedSeconds >= trafficBlockTimeoutRealSeconds)
+            {
+                FinishFailedEpisode(
+                    $"Controlled vehicle remained blocked by {trafficBlockReason} for {trafficBlockTimeoutRealSeconds:0.0}s real time. " +
                     $"targetStop={targetStopId}, moved={FormatMeters(movedDistance)}, " +
                     $"distance={FormatMeters(targetDistance)}, speed={GetVehicleSpeedMS():0.00}m/s");
             }
@@ -1404,6 +1674,8 @@ namespace DRT
             lastVehicleMovementPosition = vehiclePosition;
             lastVehicleMovementRealtime = Time.realtimeSinceStartup;
             hasVehicleMovementSample = true;
+            hasTrafficBlockSample = false;
+            trafficBlockReason = string.Empty;
         }
 
         private void ResetTravelDistanceSample(Vector3 vehiclePosition)
@@ -1434,6 +1706,45 @@ namespace DRT
             }
         }
 
+        private void RecordVehicleTraceIfNeeded()
+        {
+            if (!ShouldCollectInferenceExportData() || vehicleTraceSampleIntervalSeconds <= 0f)
+            {
+                return;
+            }
+
+            if (episodeTimeSeconds + 0.0001f < nextVehicleTraceSampleTime)
+            {
+                return;
+            }
+
+            RecordVehicleTrace("sample");
+            nextVehicleTraceSampleTime = episodeTimeSeconds + vehicleTraceSampleIntervalSeconds;
+        }
+
+        private void RecordVehicleTrace(string eventName)
+        {
+            if (!ShouldCollectInferenceExportData())
+            {
+                return;
+            }
+
+            Vector3 position = GetControlledVehicleBodyPosition();
+            vehicleTraceRecords.Add(new DRTVehicleTraceRecord
+            {
+                SampleIndex = vehicleTraceRecords.Count + 1,
+                EventName = eventName,
+                EpisodeTimeSeconds = episodeTimeSeconds,
+                CurrentStopId = currentStopId,
+                TargetStopId = targetStopId,
+                Position = position,
+                CumulativeDistanceMeters = episodeTravelDistanceMeters,
+                SpeedMetersPerSecond = GetVehicleSpeedMS(),
+                Blocked = IsVehicleTemporarilyBlocked,
+                BlockReason = TemporaryBlockReason
+            });
+        }
+
         private void LogMovementDiagnosticsIfNeeded()
         {
             if (!logMovementDiagnostics || !initialized || Time.time < nextMovementDiagnosticTime)
@@ -1449,10 +1760,10 @@ namespace DRT
             }
 
             Debug.Log(
-                $"[BUSCONTROLLER] MoveStatus playerVehicle={ControlledVehicleName}, targetStop={targetStopId}, " +
+                $"[BUSCONTROLLER] MoveStatus driver={ControlledDriverName}, vehicle={ControlledVehicleName}, targetStop={targetStopId}, " +
                 $"distance={FormatMeters(GetTargetDistanceMeters())}, speed={GetVehicleSpeedMS():0.00}m/s, " +
                 $"pathPoints={vehicleDriver?.PathPointCount}, remainingPoints={vehicleDriver?.RemainingPathPointCount}, " +
-                $"waitingForArrival={waitingForArrivalProximity}");
+                $"waitingForArrival={waitingForArrivalProximity}, blocked={IsVehicleTemporarilyBlocked}:{TemporaryBlockReason}");
         }
 
         private float GetVehicleSpeedMS()
@@ -1579,6 +1890,8 @@ namespace DRT
             episodeFinished = true;
             driving = false;
             waitingForArrivalProximity = false;
+            CompleteActiveRouteLeg(-1, null);
+            RecordVehicleTrace("episode_finished");
             vehicleDriver?.StopAndHold(true);
 
             LogInfo($"[BUSCONTROLLER] Episode finished. {reason}");
@@ -1592,6 +1905,7 @@ namespace DRT
             float averageRideSeconds = passengerManager != null ? passengerManager.GetAverageCompletedRideTime() : 0f;
             float serviceRate = passengerManager != null ? passengerManager.GetServiceRate() : 0f;
             int completedCount = passengerManager != null ? passengerManager.GetCompletedCount() : 0;
+            ExportInferenceCsvIfNeeded(reason, completedAllRequests);
 
             nextStopSelector?.NotifyEpisodeFinished(
                 completedAllRequests,
@@ -1600,6 +1914,254 @@ namespace DRT
                 averageRideSeconds,
                 serviceRate,
                 completedCount);
+        }
+
+        private void ExportInferenceCsvIfNeeded(string finishReason, bool completedAllRequests)
+        {
+            if (inferenceCsvExported || !ShouldCollectInferenceExportData() || passengerManager == null)
+            {
+                return;
+            }
+
+            inferenceCsvExported = true;
+
+            try
+            {
+                string exportDirectory = GetInferenceExportDirectory();
+                Directory.CreateDirectory(exportDirectory);
+
+                string prefix = BuildInferenceExportPrefix();
+                string passengerPath = System.IO.Path.Combine(exportDirectory, $"{prefix}_passengers.csv");
+                string routePath = System.IO.Path.Combine(exportDirectory, $"{prefix}_route_legs.csv");
+                string tracePath = System.IO.Path.Combine(exportDirectory, $"{prefix}_vehicle_trace.csv");
+                string summaryPath = System.IO.Path.Combine(exportDirectory, $"{prefix}_summary.csv");
+
+                File.WriteAllText(passengerPath, BuildPassengerCsv(), Encoding.UTF8);
+                File.WriteAllText(routePath, BuildRouteLegCsv(), Encoding.UTF8);
+                File.WriteAllText(tracePath, BuildVehicleTraceCsv(), Encoding.UTF8);
+                File.WriteAllText(summaryPath, BuildSummaryCsv(finishReason, completedAllRequests), Encoding.UTF8);
+
+                Debug.Log(
+                    $"[BUSCONTROLLER] Inference CSV exported. prefix={prefix}, " +
+                    $"directory={exportDirectory}");
+            }
+            catch (Exception exception)
+            {
+                Debug.LogError($"[BUSCONTROLLER] Failed to export inference CSV. {exception}");
+            }
+        }
+
+        private bool ShouldCollectInferenceExportData()
+        {
+            return exportInferenceCsvOnEpisodeEnd && !IsMlAgentsTrainingSession();
+        }
+
+        private static bool IsMlAgentsTrainingSession()
+        {
+            return Academy.Instance != null && Academy.Instance.IsCommunicatorOn;
+        }
+
+        private string GetInferenceExportDirectory()
+        {
+#if UNITY_EDITOR
+            string projectRoot = System.IO.Path.GetFullPath(System.IO.Path.Combine(Application.dataPath, ".."));
+            return System.IO.Path.Combine(projectRoot, "DRT_Inference_Exports");
+#else
+            return System.IO.Path.Combine(Application.persistentDataPath, "DRT_Inference_Exports");
+#endif
+        }
+
+        private string BuildInferenceExportPrefix()
+        {
+            string modeToken = GetInferenceExportModeToken();
+            string scenarioId = demandGenerator != null
+                ? demandGenerator.ExportScenarioId
+                : Mathf.Max(0, passengerManager != null ? passengerManager.Requests.Count : 0).ToString(CultureInfo.InvariantCulture);
+            string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture);
+            return SanitizeFileName($"임퍼런스_{modeToken}_시나리오_{scenarioId}_ep{episodeIndex:000}_{timestamp}");
+        }
+
+        private string GetInferenceExportModeToken()
+        {
+            return travelExecutionMode == DRTTravelExecutionMode.PhysicalDrive
+                ? "리얼드라이브"
+                : "매트릭스";
+        }
+
+        private string BuildPassengerCsv()
+        {
+            var builder = new StringBuilder();
+            builder.AppendLine("passenger_id,origin_stop_id,destination_stop_id,request_time_seconds,status,pickup_time_seconds,dropoff_time_seconds,actual_pickup_stop_id,actual_dropoff_stop_id,wait_time_seconds,ride_time_seconds,total_service_time_seconds");
+
+            foreach (var request in passengerManager.Requests.OrderBy(request => request.PassengerId))
+            {
+                builder
+                    .Append(request.PassengerId.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(request.OriginStopId.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(request.DestinationStopId.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(FormatCsvFloat(request.RequestTimeSeconds)).Append(',')
+                    .Append(CsvEscape(request.Status.ToString())).Append(',')
+                    .Append(FormatCsvFloatOrBlank(request.PickupTimeSeconds)).Append(',')
+                    .Append(FormatCsvFloatOrBlank(request.DropoffTimeSeconds)).Append(',')
+                    .Append(FormatCsvIntOrBlank(request.ActualPickupStopId)).Append(',')
+                    .Append(FormatCsvIntOrBlank(request.ActualDropoffStopId)).Append(',')
+                    .Append(FormatCsvFloat(request.GetWaitTime(episodeTimeSeconds))).Append(',')
+                    .Append(FormatCsvFloat(request.GetRideTime(episodeTimeSeconds))).Append(',')
+                    .Append(FormatCsvFloat(request.GetTotalServiceTime(episodeTimeSeconds)))
+                    .AppendLine();
+            }
+
+            return builder.ToString();
+        }
+
+        private string BuildRouteLegCsv()
+        {
+            var builder = new StringBuilder();
+            builder.AppendLine("leg_index,mode,from_stop_id,to_stop_id,arrived_stop_id,completed,departure_time_seconds,arrival_time_seconds,travel_time_seconds,leg_distance_meters,cumulative_distance_meters,planned_path_distance_meters,path_waypoint_count,boarded_count,dropped_off_count,waiting_count,on_board_count,completed_passenger_count");
+
+            foreach (var leg in routeLegRecords)
+            {
+                builder
+                    .Append(leg.LegIndex.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(CsvEscape(leg.Mode)).Append(',')
+                    .Append(leg.FromStopId.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(leg.ToStopId.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(FormatCsvIntOrBlank(leg.ArrivedStopId)).Append(',')
+                    .Append(leg.Completed ? "1" : "0").Append(',')
+                    .Append(FormatCsvFloat(leg.DepartureTimeSeconds)).Append(',')
+                    .Append(FormatCsvFloat(leg.ArrivalTimeSeconds)).Append(',')
+                    .Append(FormatCsvFloat(leg.TravelTimeSeconds)).Append(',')
+                    .Append(FormatCsvFloat(leg.LegDistanceMeters)).Append(',')
+                    .Append(FormatCsvFloat(leg.ArrivalCumulativeDistanceMeters)).Append(',')
+                    .Append(FormatCsvFloat(leg.PlannedPathDistanceMeters)).Append(',')
+                    .Append(leg.PathWaypointCount.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(leg.BoardedCount.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(leg.DroppedOffCount.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(leg.WaitingCount.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(leg.OnBoardCount.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(leg.CompletedPassengerCount.ToString(CultureInfo.InvariantCulture))
+                    .AppendLine();
+            }
+
+            return builder.ToString();
+        }
+
+        private string BuildVehicleTraceCsv()
+        {
+            var builder = new StringBuilder();
+            builder.AppendLine("sample_index,event,episode_time_seconds,current_stop_id,target_stop_id,x,y,z,cumulative_distance_meters,speed_mps,blocked,block_reason");
+
+            foreach (var trace in vehicleTraceRecords)
+            {
+                builder
+                    .Append(trace.SampleIndex.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(CsvEscape(trace.EventName)).Append(',')
+                    .Append(FormatCsvFloat(trace.EpisodeTimeSeconds)).Append(',')
+                    .Append(FormatCsvIntOrBlank(trace.CurrentStopId)).Append(',')
+                    .Append(FormatCsvIntOrBlank(trace.TargetStopId)).Append(',')
+                    .Append(FormatCsvFloat(trace.Position.x)).Append(',')
+                    .Append(FormatCsvFloat(trace.Position.y)).Append(',')
+                    .Append(FormatCsvFloat(trace.Position.z)).Append(',')
+                    .Append(FormatCsvFloat(trace.CumulativeDistanceMeters)).Append(',')
+                    .Append(FormatCsvFloat(trace.SpeedMetersPerSecond)).Append(',')
+                    .Append(trace.Blocked ? "1" : "0").Append(',')
+                    .Append(CsvEscape(trace.BlockReason))
+                    .AppendLine();
+            }
+
+            return builder.ToString();
+        }
+
+        private string BuildSummaryCsv(string finishReason, bool completedAllRequests)
+        {
+            var builder = new StringBuilder();
+            builder.AppendLine("key,value");
+            AppendSummaryRow(builder, "episode_index", episodeIndex.ToString(CultureInfo.InvariantCulture));
+            AppendSummaryRow(builder, "mode", GetInferenceExportModeToken());
+            AppendSummaryRow(builder, "travel_execution_mode", TravelExecutionModeName);
+            AppendSummaryRow(builder, "scenario_id", demandGenerator != null ? demandGenerator.ExportScenarioId : string.Empty);
+            AppendSummaryRow(builder, "scenario_description", demandGenerator != null ? demandGenerator.LoadedScenarioDescription : string.Empty);
+            AppendSummaryRow(builder, "finish_reason", finishReason);
+            AppendSummaryRow(builder, "completed_all_requests", completedAllRequests ? "1" : "0");
+            AppendSummaryRow(builder, "episode_time_seconds", FormatCsvFloat(episodeTimeSeconds));
+            AppendSummaryRow(builder, "episode_distance_meters", FormatCsvFloat(episodeTravelDistanceMeters));
+            AppendSummaryRow(builder, "total_passengers", passengerManager != null ? passengerManager.Requests.Count.ToString(CultureInfo.InvariantCulture) : "0");
+            AppendSummaryRow(builder, "completed_passengers", passengerManager != null ? passengerManager.GetCompletedCount().ToString(CultureInfo.InvariantCulture) : "0");
+            AppendSummaryRow(builder, "service_rate", passengerManager != null ? FormatCsvFloat(passengerManager.GetServiceRate()) : "0");
+            AppendSummaryRow(builder, "average_wait_seconds", passengerManager != null ? FormatCsvFloat(passengerManager.GetAverageConfirmedWaitTime()) : "0");
+            AppendSummaryRow(builder, "average_ride_seconds", passengerManager != null ? FormatCsvFloat(passengerManager.GetAverageCompletedRideTime()) : "0");
+            return builder.ToString();
+        }
+
+        private static void AppendSummaryRow(StringBuilder builder, string key, string value)
+        {
+            builder
+                .Append(CsvEscape(key))
+                .Append(',')
+                .Append(CsvEscape(value))
+                .AppendLine();
+        }
+
+        private static string SanitizeFileName(string fileName)
+        {
+            string sanitized = fileName;
+            foreach (char invalidChar in System.IO.Path.GetInvalidFileNameChars())
+            {
+                sanitized = sanitized.Replace(invalidChar, '_');
+            }
+
+            return sanitized;
+        }
+
+        private static string FormatCsvFloat(float value)
+        {
+            return value.ToString("0.###", CultureInfo.InvariantCulture);
+        }
+
+        private static string FormatCsvFloatOrBlank(float value)
+        {
+            return value >= 0f ? FormatCsvFloat(value) : string.Empty;
+        }
+
+        private static string FormatCsvIntOrBlank(int value)
+        {
+            return value > 0 ? value.ToString(CultureInfo.InvariantCulture) : string.Empty;
+        }
+
+        private static string CsvEscape(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return string.Empty;
+            }
+
+            bool mustQuote = value.Contains(",") || value.Contains("\"") || value.Contains("\r") || value.Contains("\n");
+            if (!mustQuote)
+            {
+                return value;
+            }
+
+            return $"\"{value.Replace("\"", "\"\"")}\"";
+        }
+
+        private void OnDrawGizmos()
+        {
+            if (!showAssignedPath || !showAssignedPathGizmos || assignedPathPoints == null || assignedPathPoints.Count < 2)
+            {
+                return;
+            }
+
+            Gizmos.color = assignedPathColor;
+            for (int i = 1; i < assignedPathPoints.Count; i++)
+            {
+                Gizmos.DrawLine(assignedPathPoints[i - 1], assignedPathPoints[i]);
+            }
+
+            Gizmos.color = assignedPathWaypointColor;
+            for (int i = 0; i < assignedPathPoints.Count; i++)
+            {
+                Gizmos.DrawSphere(assignedPathPoints[i], assignedPathWaypointRadius);
+            }
         }
 
         private void OnValidate()
@@ -1611,15 +2173,59 @@ namespace DRT
             stopWaypointSnapDistanceMeters = Mathf.Max(0.05f, stopWaypointSnapDistanceMeters);
             arrivalWaitTimeoutSeconds = Mathf.Max(0.5f, arrivalWaitTimeoutSeconds);
             controlledVehicleSpeedMultiplier = Mathf.Max(0.1f, controlledVehicleSpeedMultiplier);
+            gleyControlledVehicleSpeedMultiplier = Mathf.Clamp(gleyControlledVehicleSpeedMultiplier, 0.1f, 2f);
             playerWaypointReachDistanceMeters = Mathf.Max(0.5f, playerWaypointReachDistanceMeters);
+            vehicleTraceSampleIntervalSeconds = Mathf.Max(0.1f, vehicleTraceSampleIntervalSeconds);
             matrixNominalSpeedMetersPerSecond = Mathf.Max(0.1f, matrixNominalSpeedMetersPerSecond);
             enabledTrafficDensity = Mathf.Max(1, enabledTrafficDensity);
             episodeLengthSeconds = Mathf.Max(1f, episodeLengthSeconds);
             simulationSecondsPerRealSecond = Mathf.Max(0.01f, simulationSecondsPerRealSecond);
             movementDiagnosticsIntervalSeconds = Mathf.Max(0.25f, movementDiagnosticsIntervalSeconds);
             noMovementTimeoutRealSeconds = Mathf.Max(1f, noMovementTimeoutRealSeconds);
+            trafficBlockTimeoutRealSeconds = Mathf.Max(0f, trafficBlockTimeoutRealSeconds);
             minimumVehicleMovementMeters = Mathf.Max(0.01f, minimumVehicleMovementMeters);
             maxRoadWaypointDistanceMeters = Mathf.Max(0f, maxRoadWaypointDistanceMeters);
+            assignedPathLineWidth = Mathf.Max(0.01f, assignedPathLineWidth);
+            assignedPathWaypointRadius = Mathf.Max(0.01f, assignedPathWaypointRadius);
+            assignedPathVerticalOffset = Mathf.Max(0f, assignedPathVerticalOffset);
+            ApplyAssignedPathLineRenderer();
+        }
+
+        private sealed class DRTRouteLegRecord
+        {
+            public int LegIndex;
+            public string Mode;
+            public int FromStopId;
+            public int ToStopId;
+            public int ArrivedStopId;
+            public bool Completed;
+            public float DepartureTimeSeconds;
+            public float ArrivalTimeSeconds;
+            public float TravelTimeSeconds;
+            public float LegDistanceMeters;
+            public float DepartureCumulativeDistanceMeters;
+            public float ArrivalCumulativeDistanceMeters;
+            public float PlannedPathDistanceMeters;
+            public int PathWaypointCount;
+            public int BoardedCount;
+            public int DroppedOffCount;
+            public int WaitingCount;
+            public int OnBoardCount;
+            public int CompletedPassengerCount;
+        }
+
+        private sealed class DRTVehicleTraceRecord
+        {
+            public int SampleIndex;
+            public string EventName;
+            public float EpisodeTimeSeconds;
+            public int CurrentStopId;
+            public int TargetStopId;
+            public Vector3 Position;
+            public float CumulativeDistanceMeters;
+            public float SpeedMetersPerSecond;
+            public bool Blocked;
+            public string BlockReason;
         }
 
         private void LogStopMap()

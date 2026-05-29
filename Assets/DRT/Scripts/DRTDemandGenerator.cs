@@ -72,6 +72,10 @@ namespace DRT
         public int SpawnedPassengerCount { get; private set; }
         public int PendingDemandCount => CountPendingPassengers();
         public bool HasPendingDemand => HasGenerated && spawnRequestsAtRequestTime && nextReplayIndex < replaySchedule.Count;
+        public string LoadedScenarioDescription => loadedScenarioDescription;
+        public string ExportScenarioId => loadedPassengerCount > 0
+            ? loadedPassengerCount.ToString(CultureInfo.InvariantCulture)
+            : defaultRequestCount.ToString(CultureInfo.InvariantCulture);
 
         public void Configure(DRTPassengerManager newPassengerManager, int newStopCount)
         {

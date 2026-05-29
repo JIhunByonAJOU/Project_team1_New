@@ -40,6 +40,8 @@ namespace DRT
         public int PathPointCount => pathPoints.Count;
         public int RemainingPathPointCount => driving ? Mathf.Max(0, pathPoints.Count - targetPointIndex) : 0;
         public Vector3 BodyPosition => GetBodyPosition();
+        public bool IsTemporarilyBlocked => false;
+        public string TemporaryBlockReason => string.Empty;
 
         public float CurrentSpeedMS
         {
