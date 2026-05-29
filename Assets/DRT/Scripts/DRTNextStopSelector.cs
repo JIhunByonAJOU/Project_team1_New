@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Text;
+using Unity.Barracuda;
 using Unity.MLAgents;
 using Unity.MLAgents.Actuators;
 using Unity.MLAgents.Policies;
@@ -24,6 +25,12 @@ namespace DRT
         [SerializeField] private float maxTravelSecondsForObservation = 1800f;
         [SerializeField] private float maxWaitSecondsForObservation = 1800f;
         [SerializeField] private float maxDecisionWaitSeconds = 1f;
+
+        [Header("Next Stop Policy")]
+        [SerializeField] private DRTNextStopPolicy nextStopPolicy = DRTNextStopPolicy.MLAgentsTraining;
+        [Tooltip("Used only when Next Stop Policy is ONNX Inference. Import the .onnx under Assets first, then assign it here.")]
+        [SerializeField] private NNModel onnxInferenceModel;
+        [SerializeField] private InferenceDevice onnxInferenceDevice = InferenceDevice.Default;
 
         [Header("Paper Reward")]
         [SerializeField] private float unboardedPassengerPenaltyWeight = 1f;
@@ -60,6 +67,9 @@ namespace DRT
 
         public float MaxDecisionWaitSeconds => maxDecisionWaitSeconds;
         public int LastSelectedStopId => lastSelectedStopId;
+        public DRTNextStopPolicy NextStopPolicy => nextStopPolicy;
+        public string NextStopPolicyName => nextStopPolicy.ToString();
+        public bool UsesMlAgentsDecisionPolicy => nextStopPolicy != DRTNextStopPolicy.VanillaSequential;
 
         private int ObservationSize => GlobalObservationCount + maxStops * ObservationsPerStop;
 
@@ -76,6 +86,29 @@ namespace DRT
         public void Configure(DRTBusController newBusController)
         {
             busController = newBusController;
+            ConfigureBehaviorParameters();
+        }
+
+        public void ConfigureLegacyInferenceModel(NNModel model, InferenceDevice inferenceDevice)
+        {
+            if (model == null)
+            {
+                return;
+            }
+
+            if (onnxInferenceModel == null)
+            {
+                onnxInferenceModel = model;
+            }
+
+            onnxInferenceDevice = inferenceDevice;
+
+            if (nextStopPolicy == DRTNextStopPolicy.MLAgentsTraining)
+            {
+                nextStopPolicy = DRTNextStopPolicy.ONNXInference;
+            }
+
+            ConfigureBehaviorParameters();
         }
 
         public override void OnEpisodeBegin()
@@ -94,11 +127,17 @@ namespace DRT
             DRTPassengerManager passengerManager,
             float currentEpisodeTime)
         {
+            if (!UsesMlAgentsDecisionPolicy)
+            {
+                return false;
+            }
+
             if (stops == null || stops.Count == 0 || passengerManager == null)
             {
                 return false;
             }
 
+            ConfigureBehaviorParameters();
             decisionStops = stops;
             decisionPassengerManager = passengerManager;
             decisionCurrentStopId = currentStopId;
@@ -315,13 +354,38 @@ namespace DRT
         public override void Heuristic(in ActionBuffers actionsOut)
         {
             var discreteActionsOut = actionsOut.DiscreteActions;
-            int heuristicStopId = SelectNextStopId(
-                decisionCurrentStopId,
-                decisionStops,
-                decisionPassengerManager,
-                decisionEpisodeTime);
+            int heuristicStopId = nextStopPolicy == DRTNextStopPolicy.VanillaSequential
+                ? SelectVanillaSequentialStopId(
+                    decisionCurrentStopId,
+                    decisionStops,
+                    decisionPassengerManager,
+                    decisionEpisodeTime)
+                : SelectNextStopId(
+                    decisionCurrentStopId,
+                    decisionStops,
+                    decisionPassengerManager,
+                    decisionEpisodeTime);
 
             discreteActionsOut[0] = FindActionIndexForStop(heuristicStopId);
+        }
+
+        public int SelectVanillaSequentialStopId(
+            int currentStopId,
+            IReadOnlyList<DRTStop> stops,
+            DRTPassengerManager passengerManager,
+            float currentEpisodeTime)
+        {
+            int sequentialStopId = GetNextSequentialStopId(currentStopId, stops);
+            lastSelectedStopId = sequentialStopId;
+            LogSelectedStop(
+                "vanilla-sequential",
+                sequentialStopId,
+                currentStopId,
+                currentEpisodeTime,
+                passengerManager,
+                0f,
+                "fixed stop-id loop");
+            return sequentialStopId;
         }
 
         public int SelectNextStopId(
@@ -473,6 +537,11 @@ namespace DRT
                 return;
             }
 
+            if (passengerManager == null || selectedStopId < 1)
+            {
+                return;
+            }
+
             int waiting = passengerManager.GetWaitingCountAtStop(selectedStopId, currentEpisodeTime);
             int dropOff = passengerManager.GetOnBoardDestinationCount(selectedStopId);
             int scheduled = passengerManager.GetScheduledCountAtStop(selectedStopId, currentEpisodeTime);
@@ -534,7 +603,7 @@ namespace DRT
             }
 
             string modelName = behaviorParameters.Model != null ? behaviorParameters.Model.name : "-";
-            return $"{behaviorParameters.BehaviorType}/model={modelName}";
+            return $"{nextStopPolicy}/{behaviorParameters.BehaviorType}/model={modelName}";
         }
 
         private string BuildDecisionDemandSummary()
@@ -815,13 +884,22 @@ namespace DRT
             }
 
             behaviorParameters.BehaviorName = BehaviorName;
-            if (behaviorParameters.Model != null)
+
+            switch (nextStopPolicy)
             {
-                behaviorParameters.BehaviorType = BehaviorType.InferenceOnly;
-            }
-            else if (behaviorParameters.BehaviorType == BehaviorType.HeuristicOnly)
-            {
-                behaviorParameters.BehaviorType = BehaviorType.Default;
+                case DRTNextStopPolicy.ONNXInference:
+                    behaviorParameters.Model = onnxInferenceModel;
+                    behaviorParameters.InferenceDevice = onnxInferenceDevice;
+                    behaviorParameters.BehaviorType = BehaviorType.InferenceOnly;
+                    break;
+                case DRTNextStopPolicy.VanillaSequential:
+                    behaviorParameters.Model = null;
+                    behaviorParameters.BehaviorType = BehaviorType.HeuristicOnly;
+                    break;
+                default:
+                    behaviorParameters.Model = null;
+                    behaviorParameters.BehaviorType = BehaviorType.Default;
+                    break;
             }
 
             behaviorParameters.BrainParameters.VectorObservationSize = ObservationSize;
@@ -923,6 +1001,7 @@ namespace DRT
             onBoardDestinationWeight = Mathf.Max(0f, onBoardDestinationWeight);
             scheduledPassengerWeight = Mathf.Max(0f, scheduledPassengerWeight);
             distancePenaltyWeight = Mathf.Max(0f, distancePenaltyWeight);
+            ConfigureBehaviorParameters();
         }
     }
 }

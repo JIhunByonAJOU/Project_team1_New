@@ -49,7 +49,7 @@ MonoBehaviour:
     RoutesColor:
     - {r: 1, g: 1, b: 1, a: 1}
     Active: 01
-  ShowConnections: 0
+  ShowConnections: 1
   ShowPriority: 0
   ShowVehicles: 0
   ViewOtherRoads: 0
@@ -65,7 +65,7 @@ MonoBehaviour:
     RoutesColor:
     - {r: 1, g: 1, b: 1, a: 1}
     Active: 01
-  showOtherLanes: 0
+  showOtherLanes: 1
   showSpeed: 0
   viewRoadLaneChanges: 0
   leftSideTraffic: 0

@@ -50,7 +50,8 @@ namespace DRT
 
             Debug.Log(
                 $"[DRT] Auto setup complete. Stops={busStopsRoot.childCount}, " +
-                $"systemObject={systemObject.name}, mode={busController.TravelExecutionModeName}");
+                $"systemObject={systemObject.name}, mode={busController.TravelExecutionModeName}, " +
+                $"policy={nextStopSelector.NextStopPolicyName}");
         }
 
         private static DRTBusController SelectConfiguredBusController(DRTBusController[] busControllers)

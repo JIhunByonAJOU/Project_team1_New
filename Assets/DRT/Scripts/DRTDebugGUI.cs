@@ -117,7 +117,7 @@ namespace DRT
             float currentTime = busController.EpisodeTimeSeconds;
             GUILayout.Label($"Target Station: Stop {busController.TargetStopId} ({busController.TargetStopObjectName})", headerStyle);
             GUILayout.Label($"Route: Stop {busController.CurrentStopId} -> Stop {busController.TargetStopId}", smallStyle);
-            GUILayout.Label($"Mode {busController.TravelExecutionModeName} | Driver {busController.ControlledDriverName} | Vehicle {busController.ControlledVehicleName} | last served stop {busController.CurrentStopId}", smallStyle);
+            GUILayout.Label($"Mode {busController.TravelExecutionModeName} | Policy {busController.NextStopPolicyName} | Driver {busController.ControlledDriverName} | Vehicle {busController.ControlledVehicleName} | last served stop {busController.CurrentStopId}", smallStyle);
             GUILayout.Label($"speed={busController.VehicleSpeedMS:0.00}m/s, targetDist={FormatDistance(busController.TargetDistanceMeters)}, arrival<= {busController.ArrivalDistanceMeters:0.00}m, waitingArrival={busController.IsWaitingForArrivalProximity}", smallStyle);
             GUILayout.Label($"blocked={busController.IsVehicleTemporarilyBlocked} {busController.TemporaryBlockReason}", smallStyle);
             GUILayout.Label($"episodeDistance={busController.EpisodeTravelDistanceMeters:0.0}m, assignedPath={busController.AssignedPathDistanceMeters:0.0}m/{busController.AssignedPathPointCount}pts", smallStyle);

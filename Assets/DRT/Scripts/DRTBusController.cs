@@ -11,6 +11,7 @@ using Unity.Barracuda;
 using Unity.MLAgents;
 using Unity.MLAgents.Policies;
 using UnityEngine;
+using UnityEngine.Serialization;
 
 #if UNITY_EDITOR
 using UnityEditor;
@@ -39,16 +40,16 @@ namespace DRT
         [SerializeField] private float stopWaypointSnapDistanceMeters = 5f;
         [SerializeField] private float arrivalWaitTimeoutSeconds = 12f;
         [SerializeField] private float controlledVehicleSpeedMultiplier = 1.5f;
-        [Tooltip("Only used when PhysicalDrive uses the Gley vehicle driver. 1.0 keeps Gley speed unchanged; 1.12 means roughly +12%.")]
+        [Tooltip("Only used when Physical Drive uses the Gley vehicle driver. 1.0 keeps Gley speed unchanged; 1.12 means roughly +12%.")]
         [SerializeField] private float gleyControlledVehicleSpeedMultiplier = 1.12f;
         [SerializeField] private float playerWaypointReachDistanceMeters = 6f;
         [SerializeField] private bool autoFollowControlledVehicle = true;
         [SerializeField] private bool useGleyVehicleControlInPhysicalDrive = true;
 
-        [Header("Run Mode")]
-        [Tooltip("MatrixTeleportTraining is for fast PPO training. PhysicalDrive is for ONNX inference/demo with the configured vehicle driver.")]
-        [InspectorName("Run Mode (Training / Inference)")]
-        [SerializeField] private DRTTravelExecutionMode travelExecutionMode = DRTTravelExecutionMode.MatrixTeleportTraining;
+        [Header("Travel Execution")]
+        [Tooltip("Controls how the selected next stop is reached. Matrix Teleport uses the travel-time matrix; Physical Drive uses the configured vehicle driver.")]
+        [InspectorName("Travel Execution Mode")]
+        [SerializeField] private DRTTravelExecutionMode travelExecutionMode = DRTTravelExecutionMode.MatrixTeleport;
         [SerializeField] private string travelTimeMatrixResourceName = "drt_stop_travel_time_matrix";
         [SerializeField] private float matrixNominalSpeedMetersPerSecond = 15f;
         [SerializeField] private bool preferGeneratedMatrixFromGley = true;
@@ -57,13 +58,12 @@ namespace DRT
         [SerializeField] private bool logMatrixTravel = true;
         [SerializeField] private bool suppressUnityLogsDuringMatrixTraining = true;
 
-        [Header("Physical Drive Inference")]
-        [Tooltip("Optional ONNX/NNModel asset used when Run Mode is PhysicalDrive. Import the .onnx under Assets first, then assign it here.")]
-        [SerializeField] private NNModel physicalDriveInferenceModel;
-        [SerializeField] private InferenceDevice physicalDriveInferenceDevice = InferenceDevice.Default;
+        [HideInInspector, SerializeField] private NNModel physicalDriveInferenceModel;
+        [HideInInspector, SerializeField] private InferenceDevice physicalDriveInferenceDevice = InferenceDevice.Default;
 
-        [Header("Inference CSV Export")]
-        [SerializeField] private bool exportInferenceCsvOnEpisodeEnd = true;
+        [Header("Episode CSV Export")]
+        [FormerlySerializedAs("exportInferenceCsvOnEpisodeEnd")]
+        [SerializeField] private bool exportEpisodeCsvOnEpisodeEnd = true;
         [SerializeField] private float vehicleTraceSampleIntervalSeconds = 1f;
 
         [Header("Diagnostics")]
@@ -124,7 +124,7 @@ namespace DRT
         private readonly List<DRTVehicleTraceRecord> vehicleTraceRecords = new List<DRTVehicleTraceRecord>();
         private DRTRouteLegRecord activeRouteLeg;
         private float nextVehicleTraceSampleTime;
-        private bool inferenceCsvExported;
+        private bool episodeCsvExported;
         private float nextMovementDiagnosticTime;
         private Vector3 lastVehicleMovementPosition;
         private float lastVehicleMovementRealtime;
@@ -161,9 +161,13 @@ namespace DRT
         public int ActiveBackgroundVehicleCount => CountActiveBackgroundTrafficVehicles();
         public DRTTravelExecutionMode TravelExecutionMode => travelExecutionMode;
         public string TravelExecutionModeName => travelExecutionMode.ToString();
-        public bool UsesMatrixTeleportTraining => travelExecutionMode == DRTTravelExecutionMode.MatrixTeleportTraining;
+        public DRTNextStopPolicy NextStopPolicy => nextStopSelector != null ? nextStopSelector.NextStopPolicy : DRTNextStopPolicy.MLAgentsTraining;
+        public string NextStopPolicyName => nextStopSelector != null ? nextStopSelector.NextStopPolicyName : "-";
+        public bool UsesMatrixTeleport => travelExecutionMode == DRTTravelExecutionMode.MatrixTeleport;
         public bool UsesGleyVehicleControl => travelExecutionMode == DRTTravelExecutionMode.PhysicalDrive && useGleyVehicleControlInPhysicalDrive;
-        public bool SuppressUnityLogsDuringMatrixTraining => UsesMatrixTeleportTraining && suppressUnityLogsDuringMatrixTraining;
+        public bool SuppressUnityLogsDuringMatrixTraining => UsesMatrixTeleport &&
+                                                            NextStopPolicy == DRTNextStopPolicy.MLAgentsTraining &&
+                                                            suppressUnityLogsDuringMatrixTraining;
         public IReadOnlyList<DRTStop> Stops => stops;
 
         public void Configure(
@@ -217,7 +221,7 @@ namespace DRT
             currentStopId = startStopId;
             targetStopId = 0;
             ClearAssignedPathVisualization();
-            ResetInferenceExportState();
+            ResetEpisodeExportState();
             nextMovementDiagnosticTime = 0f;
             hasVehicleMovementSample = false;
             hasTrafficBlockSample = false;
@@ -259,7 +263,7 @@ namespace DRT
                 return;
             }
 
-            if (!UsesMatrixTeleportTraining)
+            if (!UsesMatrixTeleport)
             {
                 episodeTimeSeconds += Time.deltaTime * simulationSecondsPerRealSecond;
             }
@@ -269,7 +273,7 @@ namespace DRT
             TrackPhysicalTravelDistanceIfNeeded();
             RecordVehicleTraceIfNeeded();
             LogMovementDiagnosticsIfNeeded();
-            if (!UsesMatrixTeleportTraining)
+            if (!UsesMatrixTeleport)
             {
                 MonitorVehicleFailureIfNeeded();
             }
@@ -374,39 +378,7 @@ namespace DRT
             if (nextStopSelector != null)
             {
                 nextStopSelector.Configure(this);
-                ApplyPhysicalDriveInferencePolicy();
-            }
-        }
-
-        private void ApplyPhysicalDriveInferencePolicy()
-        {
-            if (nextStopSelector == null)
-            {
-                return;
-            }
-
-            var behaviorParameters = nextStopSelector.GetComponent<BehaviorParameters>();
-            if (behaviorParameters == null)
-            {
-                return;
-            }
-
-            if (travelExecutionMode == DRTTravelExecutionMode.PhysicalDrive && physicalDriveInferenceModel != null)
-            {
-                behaviorParameters.Model = physicalDriveInferenceModel;
-                behaviorParameters.InferenceDevice = physicalDriveInferenceDevice;
-            }
-
-            if (travelExecutionMode == DRTTravelExecutionMode.PhysicalDrive && behaviorParameters.Model != null)
-            {
-                behaviorParameters.BehaviorType = BehaviorType.InferenceOnly;
-
-                return;
-            }
-
-            if (travelExecutionMode == DRTTravelExecutionMode.MatrixTeleportTraining)
-            {
-                behaviorParameters.BehaviorType = BehaviorType.Default;
+                nextStopSelector.ConfigureLegacyInferenceModel(physicalDriveInferenceModel, physicalDriveInferenceDevice);
             }
         }
 
@@ -528,7 +500,7 @@ namespace DRT
             ResetControlledVehicleForEpisode();
             ResetTravelDistanceSample(GetControlledVehicleBodyPosition());
             RecordVehicleTrace("episode_start");
-            if (UsesMatrixTeleportTraining && !EnsureTravelTimeMatrix())
+            if (UsesMatrixTeleport && !EnsureTravelTimeMatrix())
             {
                 initialized = false;
                 return;
@@ -537,6 +509,7 @@ namespace DRT
             ApplyCameraFollow(GetControlledVehicleTransform());
             LogInfo(
                 $"[BUSCONTROLLER] Initialized mode={TravelExecutionModeName}, " +
+                $"policy={NextStopPolicyName}, " +
                 $"driver={ControlledDriverName}, vehicle={ControlledVehicleName}, " +
                 $"gleyControl={UsesGleyVehicleControl}, gleySpeedMultiplier={gleyControlledVehicleSpeedMultiplier:0.00}, " +
                 $"firstTargetHint={startStopId}");
@@ -733,7 +706,7 @@ namespace DRT
                 yield break;
             }
 
-            if (UsesMatrixTeleportTraining)
+            if (UsesMatrixTeleport)
             {
                 ResolveControlledVehicle(false);
             }
@@ -747,23 +720,34 @@ namespace DRT
             passengerManager?.UpdateRequestStates(episodeTimeSeconds);
 
             int nextStopId = -1;
-            bool decisionStarted = nextStopSelector.BeginDecision(currentStopId, stops, passengerManager, episodeTimeSeconds);
-            if (decisionStarted)
+            if (nextStopSelector.UsesMlAgentsDecisionPolicy)
             {
-                float waitStartTime = Time.time;
-                while (!episodeFinished && !nextStopSelector.TryConsumeDecision(out nextStopId))
+                bool decisionStarted = nextStopSelector.BeginDecision(currentStopId, stops, passengerManager, episodeTimeSeconds);
+                if (decisionStarted)
                 {
-                    if (Time.time - waitStartTime >= nextStopSelector.MaxDecisionWaitSeconds)
+                    float waitStartTime = Time.time;
+                    while (!episodeFinished && !nextStopSelector.TryConsumeDecision(out nextStopId))
                     {
-                        nextStopSelector.CancelDecision();
-                        break;
-                    }
+                        if (Time.time - waitStartTime >= nextStopSelector.MaxDecisionWaitSeconds)
+                        {
+                            nextStopSelector.CancelDecision();
+                            break;
+                        }
 
-                    yield return null;
+                        yield return null;
+                    }
                 }
             }
+            else
+            {
+                nextStopId = nextStopSelector.SelectVanillaSequentialStopId(
+                    currentStopId,
+                    stops,
+                    passengerManager,
+                    episodeTimeSeconds);
+            }
 
-            if (nextStopId < 1)
+            if (nextStopId < 1 && nextStopSelector.UsesMlAgentsDecisionPolicy)
             {
                 nextStopId = nextStopSelector.SelectNextStopId(
                     currentStopId,
@@ -787,7 +771,7 @@ namespace DRT
                 yield break;
             }
 
-            if (UsesMatrixTeleportTraining)
+            if (UsesMatrixTeleport)
             {
                 yield return ExecuteMatrixTeleportLeg(nextStop);
                 yield break;
@@ -985,7 +969,7 @@ namespace DRT
 
         private void BeginRouteLeg(int nextStopId, int pathWaypointCount, float plannedPathDistanceMeters)
         {
-            if (!ShouldCollectInferenceExportData())
+            if (!ShouldCollectEpisodeExportData())
             {
                 return;
             }
@@ -998,7 +982,7 @@ namespace DRT
             activeRouteLeg = new DRTRouteLegRecord
             {
                 LegIndex = routeLegRecords.Count + 1,
-                Mode = GetInferenceExportModeToken(),
+                Mode = GetTravelExecutionExportToken(),
                 FromStopId = currentStopId > 0 ? currentStopId : startStopId,
                 ToStopId = nextStopId,
                 ArrivedStopId = -1,
@@ -1039,13 +1023,13 @@ namespace DRT
             RecordVehicleTrace(traceEvent);
         }
 
-        private void ResetInferenceExportState()
+        private void ResetEpisodeExportState()
         {
             routeLegRecords.Clear();
             vehicleTraceRecords.Clear();
             activeRouteLeg = null;
             nextVehicleTraceSampleTime = 0f;
-            inferenceCsvExported = false;
+            episodeCsvExported = false;
         }
 
         private void TeleportControlledVehicleToStop(DRTStop stop)
@@ -1686,7 +1670,7 @@ namespace DRT
 
         private void TrackPhysicalTravelDistanceIfNeeded()
         {
-            if (UsesMatrixTeleportTraining || !initialized || episodeFinished || GetControlledVehicleTransform() == null)
+            if (UsesMatrixTeleport || !initialized || episodeFinished || GetControlledVehicleTransform() == null)
             {
                 return;
             }
@@ -1708,7 +1692,7 @@ namespace DRT
 
         private void RecordVehicleTraceIfNeeded()
         {
-            if (!ShouldCollectInferenceExportData() || vehicleTraceSampleIntervalSeconds <= 0f)
+            if (!ShouldCollectEpisodeExportData() || vehicleTraceSampleIntervalSeconds <= 0f)
             {
                 return;
             }
@@ -1724,7 +1708,7 @@ namespace DRT
 
         private void RecordVehicleTrace(string eventName)
         {
-            if (!ShouldCollectInferenceExportData())
+            if (!ShouldCollectEpisodeExportData())
             {
                 return;
             }
@@ -1905,7 +1889,7 @@ namespace DRT
             float averageRideSeconds = passengerManager != null ? passengerManager.GetAverageCompletedRideTime() : 0f;
             float serviceRate = passengerManager != null ? passengerManager.GetServiceRate() : 0f;
             int completedCount = passengerManager != null ? passengerManager.GetCompletedCount() : 0;
-            ExportInferenceCsvIfNeeded(reason, completedAllRequests);
+            ExportEpisodeCsvIfNeeded(reason, completedAllRequests);
 
             nextStopSelector?.NotifyEpisodeFinished(
                 completedAllRequests,
@@ -1916,21 +1900,21 @@ namespace DRT
                 completedCount);
         }
 
-        private void ExportInferenceCsvIfNeeded(string finishReason, bool completedAllRequests)
+        private void ExportEpisodeCsvIfNeeded(string finishReason, bool completedAllRequests)
         {
-            if (inferenceCsvExported || !ShouldCollectInferenceExportData() || passengerManager == null)
+            if (episodeCsvExported || !ShouldCollectEpisodeExportData() || passengerManager == null)
             {
                 return;
             }
 
-            inferenceCsvExported = true;
+            episodeCsvExported = true;
 
             try
             {
-                string exportDirectory = GetInferenceExportDirectory();
+                string exportDirectory = GetEpisodeExportDirectory();
                 Directory.CreateDirectory(exportDirectory);
 
-                string prefix = BuildInferenceExportPrefix();
+                string prefix = BuildEpisodeExportPrefix();
                 string passengerPath = System.IO.Path.Combine(exportDirectory, $"{prefix}_passengers.csv");
                 string routePath = System.IO.Path.Combine(exportDirectory, $"{prefix}_route_legs.csv");
                 string tracePath = System.IO.Path.Combine(exportDirectory, $"{prefix}_vehicle_trace.csv");
@@ -1942,18 +1926,18 @@ namespace DRT
                 File.WriteAllText(summaryPath, BuildSummaryCsv(finishReason, completedAllRequests), Encoding.UTF8);
 
                 Debug.Log(
-                    $"[BUSCONTROLLER] Inference CSV exported. prefix={prefix}, " +
+                    $"[BUSCONTROLLER] Episode CSV exported. prefix={prefix}, " +
                     $"directory={exportDirectory}");
             }
             catch (Exception exception)
             {
-                Debug.LogError($"[BUSCONTROLLER] Failed to export inference CSV. {exception}");
+                Debug.LogError($"[BUSCONTROLLER] Failed to export episode CSV. {exception}");
             }
         }
 
-        private bool ShouldCollectInferenceExportData()
+        private bool ShouldCollectEpisodeExportData()
         {
-            return exportInferenceCsvOnEpisodeEnd && !IsMlAgentsTrainingSession();
+            return exportEpisodeCsvOnEpisodeEnd && !IsMlAgentsTrainingSession();
         }
 
         private static bool IsMlAgentsTrainingSession()
@@ -1961,31 +1945,45 @@ namespace DRT
             return Academy.Instance != null && Academy.Instance.IsCommunicatorOn;
         }
 
-        private string GetInferenceExportDirectory()
+        private string GetEpisodeExportDirectory()
         {
 #if UNITY_EDITOR
             string projectRoot = System.IO.Path.GetFullPath(System.IO.Path.Combine(Application.dataPath, ".."));
-            return System.IO.Path.Combine(projectRoot, "DRT_Inference_Exports");
+            return System.IO.Path.Combine(projectRoot, "DRT_Episode_Exports");
 #else
-            return System.IO.Path.Combine(Application.persistentDataPath, "DRT_Inference_Exports");
+            return System.IO.Path.Combine(Application.persistentDataPath, "DRT_Episode_Exports");
 #endif
         }
 
-        private string BuildInferenceExportPrefix()
+        private string BuildEpisodeExportPrefix()
         {
-            string modeToken = GetInferenceExportModeToken();
+            string modeToken = GetTravelExecutionExportToken();
+            string policyToken = GetNextStopPolicyExportToken();
             string scenarioId = demandGenerator != null
                 ? demandGenerator.ExportScenarioId
                 : Mathf.Max(0, passengerManager != null ? passengerManager.Requests.Count : 0).ToString(CultureInfo.InvariantCulture);
             string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture);
-            return SanitizeFileName($"임퍼런스_{modeToken}_시나리오_{scenarioId}_ep{episodeIndex:000}_{timestamp}");
+            return SanitizeFileName($"drt_{modeToken}_{policyToken}_scenario_{scenarioId}_ep{episodeIndex:000}_{timestamp}");
         }
 
-        private string GetInferenceExportModeToken()
+        private string GetTravelExecutionExportToken()
         {
             return travelExecutionMode == DRTTravelExecutionMode.PhysicalDrive
-                ? "리얼드라이브"
-                : "매트릭스";
+                ? "physical_drive"
+                : "matrix_teleport";
+        }
+
+        private string GetNextStopPolicyExportToken()
+        {
+            switch (NextStopPolicy)
+            {
+                case DRTNextStopPolicy.ONNXInference:
+                    return "onnx_inference";
+                case DRTNextStopPolicy.VanillaSequential:
+                    return "vanilla_sequential";
+                default:
+                    return "ml_agents_training";
+            }
         }
 
         private string BuildPassengerCsv()
@@ -2077,8 +2075,9 @@ namespace DRT
             var builder = new StringBuilder();
             builder.AppendLine("key,value");
             AppendSummaryRow(builder, "episode_index", episodeIndex.ToString(CultureInfo.InvariantCulture));
-            AppendSummaryRow(builder, "mode", GetInferenceExportModeToken());
+            AppendSummaryRow(builder, "mode", GetTravelExecutionExportToken());
             AppendSummaryRow(builder, "travel_execution_mode", TravelExecutionModeName);
+            AppendSummaryRow(builder, "next_stop_policy", NextStopPolicyName);
             AppendSummaryRow(builder, "scenario_id", demandGenerator != null ? demandGenerator.ExportScenarioId : string.Empty);
             AppendSummaryRow(builder, "scenario_description", demandGenerator != null ? demandGenerator.LoadedScenarioDescription : string.Empty);
             AppendSummaryRow(builder, "finish_reason", finishReason);
