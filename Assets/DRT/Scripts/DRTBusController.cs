@@ -318,14 +318,19 @@ namespace DRT
             {
                 Transform child = busStopsRoot.GetChild(i);
                 var stop = child.GetComponent<DRTStop>();
-                if (stop == null)
-                {
-                    stop = child.gameObject.AddComponent<DRTStop>();
-                }
 
                 if (TryParseStopIdFromName(child.name, out int parsedStopId))
                 {
+                    if (stop == null)
+                    {
+                        stop = child.gameObject.AddComponent<DRTStop>();
+                    }
+
                     stop.SetStopId(parsedStopId);
+                }
+                else if (stop == null)
+                {
+                    continue;
                 }
                 else if (stop.StopId < 1)
                 {
@@ -340,7 +345,7 @@ namespace DRT
             var duplicateIds = stops
                 .GroupBy(stop => stop.StopId)
                 .Where(group => group.Count() > 1)
-                .Select(group => group.Key)
+                .Select(group => $"{group.Key} ({string.Join(", ", group.Select(stop => stop.name))})")
                 .ToList();
 
             if (duplicateIds.Count > 0)

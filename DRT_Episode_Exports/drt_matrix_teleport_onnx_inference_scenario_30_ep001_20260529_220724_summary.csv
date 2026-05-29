@@ -1,0 +1,16 @@
+﻿key,value
+episode_index,1
+mode,matrix_teleport
+travel_execution_mode,MatrixTeleport
+next_stop_policy,ONNXInference
+scenario_id,30
+scenario_description,resource:drt_scenario_30
+finish_reason,All passenger requests completed.
+completed_all_requests,1
+episode_time_seconds,3929.223
+episode_distance_meters,58938.36
+total_passengers,30
+completed_passengers,30
+service_rate,1
+average_wait_seconds,219.98
+average_ride_seconds,327.569
