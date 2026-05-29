@@ -883,8 +883,6 @@ namespace DRT
                 return;
             }
 
-            behaviorParameters.BehaviorName = BehaviorName;
-
             switch (nextStopPolicy)
             {
                 case DRTNextStopPolicy.ONNXInference:
@@ -902,6 +900,7 @@ namespace DRT
                     break;
             }
 
+            behaviorParameters.BehaviorName = BehaviorName;
             behaviorParameters.BrainParameters.VectorObservationSize = ObservationSize;
             behaviorParameters.BrainParameters.NumStackedVectorObservations = 1;
             behaviorParameters.BrainParameters.ActionSpec = new ActionSpec(0, new[] { maxStops });
