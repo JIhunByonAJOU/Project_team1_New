@@ -26,6 +26,19 @@ from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, 
 
 
 TARGET_POLICIES = ("Vanilla Sequential", "ONNX Inference")
+REPORT_METRICS = [
+    "episode_distance_meters",
+    "episode_time_seconds",
+    "service_rate",
+    "completed_passengers",
+    "completed_all_requests",
+    "average_wait_seconds",
+    "p95_wait_seconds",
+    "max_wait_seconds",
+    "average_ride_seconds",
+    "route_leg_count",
+    "reward",
+]
 LOWER_IS_BETTER = {
     "episode_distance_meters",
     "episode_time_seconds",
@@ -100,6 +113,21 @@ def parse_args() -> argparse.Namespace:
         "--matrix-csv",
         default="Assets/DRT/Resources/drt_stop_travel_time_matrix.csv",
         help="Travel-time matrix CSV used to reconstruct the reward scale.",
+    )
+    parser.add_argument(
+        "--selected-runs-csv",
+        default=None,
+        help="Optional path for the selected run-level metrics CSV.",
+    )
+    parser.add_argument(
+        "--aggregate-csv",
+        default=None,
+        help="Optional path for the aggregate comparison metrics CSV.",
+    )
+    parser.add_argument(
+        "--markdown-output",
+        default=None,
+        help="Optional path for a Markdown comparison report.",
     )
     return parser.parse_args()
 
@@ -546,6 +574,171 @@ def make_table(data: list[list[object]], widths: list[float] | None = None, head
     return table
 
 
+def write_selected_runs_csv(path: Path, selected: dict[str, list[EpisodeRecord]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "policy",
+        "run_order",
+        "episode_index",
+        "timestamp",
+        "scenario_id",
+        "source_summary_csv",
+        "finish_reason",
+        "completed_all_requests_raw",
+        *REPORT_METRICS,
+    ]
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for policy in TARGET_POLICIES:
+            for run_order, record in enumerate(selected.get(policy, []), start=1):
+                row: dict[str, object] = {
+                    "policy": policy,
+                    "run_order": run_order,
+                    "episode_index": record.values.get("episode_index", ""),
+                    "timestamp": record.timestamp.isoformat(sep=" ") if record.timestamp else "",
+                    "scenario_id": record.scenario_id,
+                    "source_summary_csv": str(record.path),
+                    "finish_reason": record.values.get("finish_reason", ""),
+                    "completed_all_requests_raw": record.values.get("completed_all_requests", ""),
+                }
+                for metric in REPORT_METRICS:
+                    row[metric] = record.metrics.get(metric, "")
+                writer.writerow(row)
+
+
+def write_aggregate_csv(path: Path, selected: dict[str, list[EpisodeRecord]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "metric",
+        "label",
+        "direction",
+        "vanilla_mean",
+        "vanilla_std",
+        "vanilla_n",
+        "onnx_mean",
+        "onnx_std",
+        "onnx_n",
+        "onnx_minus_vanilla",
+        "onnx_pct_change_vs_vanilla",
+        "status",
+    ]
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for metric in REPORT_METRICS:
+            agg = aggregate(selected, metric)
+            vanilla_avg, vanilla_std, vanilla_count = agg["Vanilla Sequential"]
+            onnx_avg, onnx_std, onnx_count = agg["ONNX Inference"]
+            delta = None if vanilla_avg is None or onnx_avg is None else onnx_avg - vanilla_avg
+            pct_delta = None
+            if delta is not None and vanilla_avg is not None and not math.isclose(vanilla_avg, 0.0):
+                pct_delta = delta / vanilla_avg
+            writer.writerow(
+                {
+                    "metric": metric,
+                    "label": metric_label(metric),
+                    "direction": "lower_is_better"
+                    if metric in LOWER_IS_BETTER
+                    else "higher_is_better"
+                    if metric in HIGHER_IS_BETTER
+                    else "manual",
+                    "vanilla_mean": vanilla_avg if vanilla_avg is not None else "",
+                    "vanilla_std": vanilla_std if vanilla_std is not None else "",
+                    "vanilla_n": vanilla_count,
+                    "onnx_mean": onnx_avg if onnx_avg is not None else "",
+                    "onnx_std": onnx_std if onnx_std is not None else "",
+                    "onnx_n": onnx_count,
+                    "onnx_minus_vanilla": delta if delta is not None else "",
+                    "onnx_pct_change_vs_vanilla": pct_delta if pct_delta is not None else "",
+                    "status": comparison_status(metric, vanilla_avg, onnx_avg),
+                }
+            )
+
+
+def markdown_metric_row(metric: str, selected: dict[str, list[EpisodeRecord]]) -> list[str]:
+    agg = aggregate(selected, metric)
+    vanilla_avg, vanilla_std, vanilla_count = agg["Vanilla Sequential"]
+    onnx_avg, onnx_std, onnx_count = agg["ONNX Inference"]
+    suffix, digits = metric_suffix(metric)
+    delta = None if vanilla_avg is None or onnx_avg is None else onnx_avg - vanilla_avg
+    pct_delta = ""
+    if delta is not None and vanilla_avg is not None and not math.isclose(vanilla_avg, 0.0):
+        pct_delta = f"{delta / vanilla_avg:+.1%}"
+    return [
+        metric_label(metric),
+        fmt_mean_std(vanilla_avg, vanilla_std, vanilla_count, suffix, digits),
+        fmt_mean_std(onnx_avg, onnx_std, onnx_count, suffix, digits),
+        fmt_number(delta, suffix, digits),
+        pct_delta,
+        comparison_status(metric, vanilla_avg, onnx_avg),
+    ]
+
+
+def write_markdown_report(
+    path: Path,
+    selected: dict[str, list[EpisodeRecord]],
+    scenario_id: str | None,
+    runs_per_policy: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# DRT Matrix Teleport Policy Comparison",
+        "",
+        f"- Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- Scenario: {scenario_id or 'not selected'}",
+        f"- Target runs per policy: {runs_per_policy}",
+        f"- Vanilla selected runs: {len(selected.get('Vanilla Sequential', []))}",
+        f"- ONNX selected runs: {len(selected.get('ONNX Inference', []))}",
+        "",
+        "## Aggregate Metrics",
+        "",
+        "| Metric | Vanilla Sequential | ONNX Inference | ONNX - Vanilla | % change | Direction |",
+        "|---|---:|---:|---:|---:|---|",
+    ]
+    for metric in REPORT_METRICS:
+        row = markdown_metric_row(metric, selected)
+        lines.append("| " + " | ".join(row) + " |")
+
+    lines.extend(
+        [
+            "",
+            "## Interpretation",
+            "",
+            "- Service completion is equal when both policies show completed_all_requests=1 and service_rate=1.0.",
+            "- Lower distance, episode time, wait time, ride time, and route leg count are operational improvements.",
+            "- Higher reward is better because the reconstructed reward follows the current paper reward terms.",
+            "- Reward is reconstructed from route/passenger CSVs when Unity summary CSVs do not export a reward field.",
+            "",
+            "## Selected Run CSVs",
+            "",
+        ]
+    )
+    for policy in TARGET_POLICIES:
+        lines.append(f"### {policy}")
+        lines.append("")
+        lines.append("| Run | Episode | Timestamp | Distance (m) | Avg wait (s) | Reward |")
+        lines.append("|---:|---:|---|---:|---:|---:|")
+        for run_order, record in enumerate(selected.get(policy, []), start=1):
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(run_order),
+                        record.values.get("episode_index", ""),
+                        record.timestamp.strftime("%Y-%m-%d %H:%M:%S") if record.timestamp else "",
+                        fmt_number(record.metrics.get("episode_distance_meters")),
+                        fmt_number(record.metrics.get("average_wait_seconds")),
+                        fmt_number(record.metrics.get("reward")),
+                    ]
+                )
+                + " |"
+            )
+        lines.append("")
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def build_pdf(
     output_path: Path,
     export_dirs: list[str],
@@ -627,19 +820,7 @@ def build_pdf(
         )
     story.append(Spacer(1, 8))
 
-    metrics = [
-        "episode_distance_meters",
-        "episode_time_seconds",
-        "service_rate",
-        "completed_passengers",
-        "completed_all_requests",
-        "average_wait_seconds",
-        "p95_wait_seconds",
-        "max_wait_seconds",
-        "average_ride_seconds",
-        "route_leg_count",
-        "reward",
-    ]
+    metrics = REPORT_METRICS
     story.append(Paragraph("Aggregate Metrics", styles["Heading2"]))
     metric_rows = [["Metric", "Vanilla Sequential", "ONNX Inference", "ONNX - Vanilla", "Direction"]]
     for metric in metrics:
@@ -732,9 +913,21 @@ def main() -> int:
     selected = select_latest(records, scenario_id, args.runs_per_policy, args.include_incomplete)
     output_path = Path(args.output)
     build_pdf(output_path, args.exports, records, selected, scenario_id, args.runs_per_policy, args.include_incomplete)
+    if args.selected_runs_csv:
+        write_selected_runs_csv(Path(args.selected_runs_csv), selected)
+    if args.aggregate_csv:
+        write_aggregate_csv(Path(args.aggregate_csv), selected)
+    if args.markdown_output:
+        write_markdown_report(Path(args.markdown_output), selected, scenario_id, args.runs_per_policy)
 
     counts = {policy: len(selected.get(policy, [])) for policy in TARGET_POLICIES}
     print(f"Wrote {output_path}")
+    if args.selected_runs_csv:
+        print(f"Wrote {args.selected_runs_csv}")
+    if args.aggregate_csv:
+        print(f"Wrote {args.aggregate_csv}")
+    if args.markdown_output:
+        print(f"Wrote {args.markdown_output}")
     print(f"Selected scenario: {scenario_id or 'none'}")
     for policy in TARGET_POLICIES:
         print(f"{policy}: {counts[policy]} / {args.runs_per_policy} runs")

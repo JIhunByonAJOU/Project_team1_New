@@ -38,6 +38,7 @@ namespace DRT
 
         public void Configure(int newVehicleIndex, VehicleTypes newVehicleType, float newSpeedMultiplier = 1f)
         {
+            hideFlags = HideFlags.HideInInspector;
             vehicleIndex = Mathf.Max(0, newVehicleIndex);
             vehicleType = newVehicleType;
             speedMultiplier = Mathf.Clamp(newSpeedMultiplier, 0.1f, 2f);

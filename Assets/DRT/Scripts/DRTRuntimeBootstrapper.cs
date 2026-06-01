@@ -43,13 +43,12 @@ namespace DRT
             var busController = GetOrAdd<DRTBusController>(systemObject);
             var debugGui = GetOrAdd<DRTDebugGUI>(systemObject);
 
-            demandGenerator.Configure(passengerManager, busStopsRoot.childCount);
-            nextStopSelector.Configure(busController);
             busController.Configure(busStopsRoot, passengerManager, demandGenerator, nextStopSelector, 0, 1);
             debugGui.Configure(passengerManager, busController);
 
+            int loadedStopCount = busController.Stops != null ? busController.Stops.Count : busStopsRoot.childCount;
             Debug.Log(
-                $"[DRT] Auto setup complete. Stops={busStopsRoot.childCount}, " +
+                $"[DRT] Auto setup complete. Stops={loadedStopCount}, " +
                 $"systemObject={systemObject.name}, mode={busController.TravelExecutionModeName}, " +
                 $"policy={nextStopSelector.NextStopPolicyName}");
         }
@@ -216,8 +215,11 @@ namespace DRT
                 var typeName = behaviour.GetType().FullName;
                 if (typeName == "Gley.TrafficSystem.Internal.TrafficExample")
                 {
-                    behaviour.enabled = false;
-                    Debug.Log("[DRT] Disabled Gley TrafficExample to avoid duplicate vehicle control.");
+                    if (behaviour.enabled)
+                    {
+                        behaviour.enabled = false;
+                        Debug.Log("[DRT] Disabled Gley TrafficExample to avoid duplicate vehicle control.");
+                    }
                 }
             }
         }

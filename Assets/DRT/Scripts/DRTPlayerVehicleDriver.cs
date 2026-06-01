@@ -63,6 +63,7 @@ namespace DRT
 
         public void Configure(VehicleTypes newVehicleType, float newSpeedMultiplier, float newWaypointReachDistance, float newFinalReachDistance)
         {
+            hideFlags = HideFlags.HideInInspector;
             vehicleType = newVehicleType;
             speedMultiplier = Mathf.Max(0.1f, newSpeedMultiplier);
             waypointReachDistanceMeters = Mathf.Max(0.5f, newWaypointReachDistance);

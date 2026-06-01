@@ -20,7 +20,7 @@ namespace DRT
         [SerializeField] private DRTBusController busController;
         [SerializeField, Min(2)] private int maxStops = 16;
         [SerializeField] private bool skipCurrentStop = true;
-        [SerializeField] private float episodeLengthSeconds = 3600f;
+        [HideInInspector, SerializeField] private float episodeLengthSeconds = 3000f;
         [SerializeField] private float maxDistanceForObservation = 500f;
         [SerializeField] private float maxTravelSecondsForObservation = 1800f;
         [SerializeField] private float maxWaitSecondsForObservation = 1800f;
@@ -36,22 +36,22 @@ namespace DRT
         [SerializeField] private float unboardedPassengerPenaltyWeight = 1f;
         [SerializeField] private float boardingRewardWeight = 1f;
         [SerializeField] private float dropoffRewardWeight = 1f;
-        [SerializeField] private float acceptableWaitSeconds = 600f;
-        [SerializeField] private float acceptableWaitRewardMultiplier = 10f;
+        [SerializeField] private float acceptableWaitSeconds = 100f;
+        [SerializeField] private float acceptableWaitRewardMultiplier = 5f;
         [SerializeField] private float networkDistanceUnitsPerMinute = 100f;
         [SerializeField] private float minimumNetworkAverageReward = 0.01f;
         [SerializeField] private float invalidActionPenalty = 0f;
-        [SerializeField] private bool logReward = true;
+        [HideInInspector, SerializeField] private bool logReward = true;
 
         [Header("Heuristic Fallback")]
         [SerializeField] private float waitingPassengerWeight = 3f;
         [SerializeField] private float onBoardDestinationWeight = 5f;
         [SerializeField] private float scheduledPassengerWeight = 0.5f;
         [SerializeField] private float distancePenaltyWeight = 0.002f;
-        [SerializeField] private bool logDecision = true;
+        [HideInInspector, SerializeField] private bool logDecision = true;
 
         [Header("Diagnostics")]
-        [SerializeField] private bool logPolicyAction = true;
+        [HideInInspector, SerializeField] private bool logPolicyAction = true;
 
         private IReadOnlyList<DRTStop> decisionStops;
         private DRTPassengerManager decisionPassengerManager;
@@ -86,29 +86,19 @@ namespace DRT
         public void Configure(DRTBusController newBusController)
         {
             busController = newBusController;
+            if (busController != null)
+            {
+                episodeLengthSeconds = busController.EpisodeLengthSeconds;
+            }
+
             ConfigureBehaviorParameters();
         }
 
-        public void ConfigureLegacyInferenceModel(NNModel model, InferenceDevice inferenceDevice)
+        public void ConfigureDiagnostics(bool newLogReward, bool newLogDecision, bool newLogPolicyAction)
         {
-            if (model == null)
-            {
-                return;
-            }
-
-            if (onnxInferenceModel == null)
-            {
-                onnxInferenceModel = model;
-            }
-
-            onnxInferenceDevice = inferenceDevice;
-
-            if (nextStopPolicy == DRTNextStopPolicy.MLAgentsTraining)
-            {
-                nextStopPolicy = DRTNextStopPolicy.ONNXInference;
-            }
-
-            ConfigureBehaviorParameters();
+            logReward = newLogReward;
+            logDecision = newLogDecision;
+            logPolicyAction = newLogPolicyAction;
         }
 
         public override void OnEpisodeBegin()
@@ -883,6 +873,8 @@ namespace DRT
                 return;
             }
 
+            behaviorParameters.hideFlags = HideFlags.HideInInspector;
+
             switch (nextStopPolicy)
             {
                 case DRTNextStopPolicy.ONNXInference:
@@ -916,7 +908,7 @@ namespace DRT
 
         private bool ShouldSuppressUnityLogs()
         {
-            return busController != null && busController.SuppressUnityLogsDuringMatrixTraining;
+            return busController != null && busController.SuppressUnityLogsDuringMatrixTeleport;
         }
 
         private void ResolveBusController()

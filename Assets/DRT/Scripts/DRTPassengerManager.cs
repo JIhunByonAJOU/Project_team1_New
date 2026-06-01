@@ -7,13 +7,18 @@ namespace DRT
     public class DRTPassengerManager : MonoBehaviour
     {
         [SerializeField] private int busCapacity = 6;
-        [SerializeField] private bool logStopProcessing = true;
+        [HideInInspector, SerializeField] private bool logStopProcessing = true;
         [SerializeField] private List<DRTPassengerRequest> requests = new List<DRTPassengerRequest>();
 
         private int nextPassengerId = 1;
 
         public IReadOnlyList<DRTPassengerRequest> Requests => requests;
         public int BusCapacity => busCapacity;
+
+        public void ConfigureDiagnostics(bool newLogStopProcessing)
+        {
+            logStopProcessing = newLogStopProcessing;
+        }
 
         public void ClearRequests()
         {

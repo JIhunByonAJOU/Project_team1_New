@@ -54,13 +54,13 @@ namespace DRT
         [SerializeField] private bool spawnRequestsAtRequestTime = true;
 
         [Header("Fallback / Manual Demand")]
-        [SerializeField] private int stopCount = 8;
-        [SerializeField] private float episodeLengthSeconds = 3600f;
+        [HideInInspector, SerializeField] private int stopCount = 8;
+        [HideInInspector, SerializeField] private float episodeLengthSeconds = 3000f;
         [SerializeField, Range(6, 30)] private int defaultRequestCount = 14;
         [SerializeField] private List<DRTDemandScheduleEntry> demandSchedule = new List<DRTDemandScheduleEntry>();
 
         [Header("Diagnostics")]
-        [SerializeField] private bool logSpawnedRequests;
+        [HideInInspector, SerializeField] private bool logSpawnedRequests;
 
         private readonly List<DRTDemandReplayEntry> replaySchedule = new List<DRTDemandReplayEntry>();
         private int nextReplayIndex;
@@ -79,8 +79,19 @@ namespace DRT
 
         public void Configure(DRTPassengerManager newPassengerManager, int newStopCount)
         {
+            Configure(newPassengerManager, newStopCount, episodeLengthSeconds);
+        }
+
+        public void Configure(DRTPassengerManager newPassengerManager, int newStopCount, float newEpisodeLengthSeconds)
+        {
             passengerManager = newPassengerManager;
             stopCount = Mathf.Max(2, newStopCount);
+            episodeLengthSeconds = Mathf.Max(1f, newEpisodeLengthSeconds);
+        }
+
+        public void ConfigureDiagnostics(bool newLogSpawnedRequests)
+        {
+            logSpawnedRequests = newLogSpawnedRequests;
         }
 
         private void Start()
@@ -115,7 +126,7 @@ namespace DRT
             SpawnedPassengerCount = 0;
             loadedScenarioDescription = "-";
 
-            if (!TryBuildReplaySchedule(out List<DRTDemandReplayEntry> sourceSchedule, out string error))
+            if (!TryBuildReplaySchedule(suppressLog, out List<DRTDemandReplayEntry> sourceSchedule, out string error))
             {
                 HasGenerated = false;
                 Debug.LogError($"[DEMANDGENERATOR] Cannot load demand scenario. {error}");
@@ -126,7 +137,7 @@ namespace DRT
             for (int i = 0; i < sourceSchedule.Count; i++)
             {
                 var entry = sourceSchedule[i];
-                if (!IsValidEntry(entry))
+                if (!IsValidEntry(entry, suppressLog))
                 {
                     continue;
                 }
@@ -202,7 +213,7 @@ namespace DRT
             return spawned;
         }
 
-        private bool TryBuildReplaySchedule(out List<DRTDemandReplayEntry> result, out string error)
+        private bool TryBuildReplaySchedule(bool suppressLog, out List<DRTDemandReplayEntry> result, out string error)
         {
             result = null;
             error = null;
@@ -220,7 +231,7 @@ namespace DRT
                     }
 
                     loadedScenarioDescription = $"resource:{resourceName}";
-                    return TryParseCsvSchedule(csvAsset.text, loadedScenarioDescription, out result, out error);
+                    return TryParseCsvSchedule(csvAsset.text, loadedScenarioDescription, suppressLog, out result, out error);
                 }
 
                 case DRTDemandSource.CsvTextAsset:
@@ -232,7 +243,7 @@ namespace DRT
                     }
 
                     loadedScenarioDescription = $"asset:{scenarioCsvAsset.name}";
-                    return TryParseCsvSchedule(scenarioCsvAsset.text, loadedScenarioDescription, out result, out error);
+                    return TryParseCsvSchedule(scenarioCsvAsset.text, loadedScenarioDescription, suppressLog, out result, out error);
                 }
 
                 case DRTDemandSource.InspectorSchedule:
@@ -254,6 +265,7 @@ namespace DRT
         private bool TryParseCsvSchedule(
             string csvText,
             string sourceDescription,
+            bool suppressLog,
             out List<DRTDemandReplayEntry> result,
             out string error)
         {
@@ -339,7 +351,7 @@ namespace DRT
                     originStopId = originStopId,
                     destinationStopId = destinationStopId,
                     passengerCount = 1,
-                    initialStatus = ReadInitialStatus(fields, statusColumn, rowNumber),
+                    initialStatus = ReadInitialStatus(fields, statusColumn, rowNumber, suppressLog),
                     sourceDescription = $"{sourceDescription}:row{rowNumber}"
                 });
             }
@@ -457,7 +469,7 @@ namespace DRT
             return spawned;
         }
 
-        private bool IsValidEntry(DRTDemandReplayEntry entry)
+        private bool IsValidEntry(DRTDemandReplayEntry entry, bool suppressLog)
         {
             if (entry == null)
             {
@@ -466,16 +478,24 @@ namespace DRT
 
             if (entry.originStopId == entry.destinationStopId)
             {
-                Debug.LogWarning(
-                    $"[DEMANDGENERATOR] Demand ignored ({entry.sourceDescription}). " +
-                    $"Origin and destination are both Stop {entry.originStopId}.");
+                if (!suppressLog)
+                {
+                    Debug.LogWarning(
+                        $"[DEMANDGENERATOR] Demand ignored ({entry.sourceDescription}). " +
+                        $"Origin and destination are both Stop {entry.originStopId}.");
+                }
+
                 return false;
             }
 
             if (entry.originStopId < 1 || entry.destinationStopId < 1)
             {
-                Debug.LogWarning(
-                    $"[DEMANDGENERATOR] Demand ignored ({entry.sourceDescription}). Stop IDs must start at 1.");
+                if (!suppressLog)
+                {
+                    Debug.LogWarning(
+                        $"[DEMANDGENERATOR] Demand ignored ({entry.sourceDescription}). Stop IDs must start at 1.");
+                }
+
                 return false;
             }
 
@@ -572,7 +592,7 @@ namespace DRT
             return normalized;
         }
 
-        private static DRTPassengerStatus ReadInitialStatus(string[] fields, int statusColumn, int rowNumber)
+        private static DRTPassengerStatus ReadInitialStatus(string[] fields, int statusColumn, int rowNumber, bool suppressLog)
         {
             if (statusColumn < 0 || !TryGetField(fields, statusColumn, out string statusText) || string.IsNullOrWhiteSpace(statusText))
             {
@@ -581,7 +601,11 @@ namespace DRT
 
             if (!Enum.TryParse(statusText.Trim(), true, out DRTPassengerStatus parsedStatus))
             {
-                Debug.LogWarning($"[DEMANDGENERATOR] CSV row {rowNumber} has unknown status '{statusText}'. Spawning as Scheduled.");
+                if (!suppressLog)
+                {
+                    Debug.LogWarning($"[DEMANDGENERATOR] CSV row {rowNumber} has unknown status '{statusText}'. Spawning as Scheduled.");
+                }
+
                 return DRTPassengerStatus.Scheduled;
             }
 
