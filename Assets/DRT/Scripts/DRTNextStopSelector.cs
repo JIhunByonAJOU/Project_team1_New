@@ -59,12 +59,20 @@ namespace DRT
         private int episodeDecisionCount;
         private int episodeStopArrivalCount;
         private float episodeRewardTotal;
+        private readonly List<int> allStationRoute = new List<int>();
+        private string allStationRouteSignature = string.Empty;
+        private int allStationRouteCursor;
+        private bool allStationRunComplete;
 
         public float MaxDecisionWaitSeconds => maxDecisionWaitSeconds;
         public int LastSelectedStopId => lastSelectedStopId;
         public DRTNextStopPolicy NextStopPolicy => nextStopPolicy;
         public string NextStopPolicyName => nextStopPolicy.ToString();
-        public bool UsesMlAgentsDecisionPolicy => nextStopPolicy != DRTNextStopPolicy.VanillaSequential;
+        public bool UsesMlAgentsDecisionPolicy =>
+            nextStopPolicy != DRTNextStopPolicy.VanillaSequential &&
+            nextStopPolicy != DRTNextStopPolicy.AllStationRunner;
+        public bool UsesAllStationRunner => nextStopPolicy == DRTNextStopPolicy.AllStationRunner;
+        public bool IsAllStationRunComplete => UsesAllStationRunner && allStationRunComplete;
 
         private int ObservationSize => GlobalObservationCount + maxStops * ObservationsPerStop;
 
@@ -102,6 +110,7 @@ namespace DRT
             episodeDecisionCount = 0;
             episodeStopArrivalCount = 0;
             episodeRewardTotal = 0f;
+            ResetAllStationRunnerState();
             ResolveBusController();
             busController?.ResetEpisodeFromAgent();
         }
@@ -162,6 +171,22 @@ namespace DRT
 
         public void RecordStopArrival(DRTStopProcessResult result, float currentEpisodeTime)
         {
+            if (UsesAllStationRunner)
+            {
+                episodeStopArrivalCount++;
+                if (allStationRoute.Count > 0 &&
+                    allStationRouteCursor >= allStationRoute.Count - 1 &&
+                    allStationRouteCursor < allStationRoute.Count &&
+                    result.StopId == allStationRoute[allStationRouteCursor])
+                {
+                    allStationRunComplete = true;
+                }
+
+                RecordStat("DRT/StopArrivals", 1f, StatAggregationMethod.Sum);
+                RecordStat("DRT/EpisodeStopArrivalCount", episodeStopArrivalCount, StatAggregationMethod.MostRecent);
+                return;
+            }
+
             if (decisionPassengerManager == null)
             {
                 return;
@@ -339,17 +364,30 @@ namespace DRT
         public override void Heuristic(in ActionBuffers actionsOut)
         {
             var discreteActionsOut = actionsOut.DiscreteActions;
-            int heuristicStopId = nextStopPolicy == DRTNextStopPolicy.VanillaSequential
-                ? SelectVanillaSequentialStopId(
+            int heuristicStopId;
+            if (nextStopPolicy == DRTNextStopPolicy.AllStationRunner)
+            {
+                heuristicStopId = SelectAllStationRunnerStopId(
                     decisionCurrentStopId,
                     decisionStops,
-                    decisionPassengerManager,
-                    decisionEpisodeTime)
-                : SelectNextStopId(
+                    decisionEpisodeTime);
+            }
+            else if (nextStopPolicy == DRTNextStopPolicy.VanillaSequential)
+            {
+                heuristicStopId = SelectVanillaSequentialStopId(
                     decisionCurrentStopId,
                     decisionStops,
                     decisionPassengerManager,
                     decisionEpisodeTime);
+            }
+            else
+            {
+                heuristicStopId = SelectNextStopId(
+                    decisionCurrentStopId,
+                    decisionStops,
+                    decisionPassengerManager,
+                    decisionEpisodeTime);
+            }
 
             discreteActionsOut[0] = FindActionIndexForStop(heuristicStopId);
         }
@@ -371,6 +409,41 @@ namespace DRT
                 0f,
                 "fixed stop-id loop");
             return sequentialStopId;
+        }
+
+        public int SelectAllStationRunnerStopId(
+            int currentStopId,
+            IReadOnlyList<DRTStop> stops,
+            float currentEpisodeTime)
+        {
+            if (stops == null || stops.Count < 2)
+            {
+                allStationRunComplete = true;
+                return -1;
+            }
+
+            EnsureAllStationRoute(currentStopId, stops);
+            AlignAllStationCursor(currentStopId);
+
+            if (allStationRunComplete || allStationRouteCursor >= allStationRoute.Count - 1)
+            {
+                allStationRunComplete = true;
+                return -1;
+            }
+
+            int nextStopId = allStationRoute[allStationRouteCursor + 1];
+            allStationRouteCursor++;
+            lastSelectedStopId = nextStopId;
+
+            if (logDecision && !ShouldSuppressUnityLogs())
+            {
+                Debug.Log(
+                    $"[NEXTSTOPSELECTOR] AllStationRunner t={currentEpisodeTime:0.0}s " +
+                    $"current={currentStopId} selected={nextStopId} " +
+                    $"progress={allStationRouteCursor}/{Mathf.Max(0, allStationRoute.Count - 1)}");
+            }
+
+            return nextStopId;
         }
 
         public int SelectNextStopId(
@@ -881,6 +954,10 @@ namespace DRT
                     behaviorParameters.Model = null;
                     behaviorParameters.BehaviorType = BehaviorType.HeuristicOnly;
                     break;
+                case DRTNextStopPolicy.AllStationRunner:
+                    behaviorParameters.Model = null;
+                    behaviorParameters.BehaviorType = BehaviorType.HeuristicOnly;
+                    break;
                 default:
                     behaviorParameters.Model = null;
                     behaviorParameters.BehaviorType = BehaviorType.Default;
@@ -954,6 +1031,141 @@ namespace DRT
             }
 
             return -1;
+        }
+
+        private void ResetAllStationRunnerState()
+        {
+            allStationRoute.Clear();
+            allStationRouteSignature = string.Empty;
+            allStationRouteCursor = 0;
+            allStationRunComplete = false;
+        }
+
+        private void EnsureAllStationRoute(int currentStopId, IReadOnlyList<DRTStop> stops)
+        {
+            string signature = BuildAllStationRouteSignature(stops);
+            if (allStationRoute.Count > 0 && allStationRouteSignature == signature)
+            {
+                return;
+            }
+
+            allStationRoute.Clear();
+            allStationRouteSignature = signature;
+            allStationRouteCursor = 0;
+            allStationRunComplete = false;
+
+            List<int> stopIds = GetSortedStopIds(stops);
+            if (stopIds.Count < 2)
+            {
+                allStationRunComplete = true;
+                return;
+            }
+
+            int startStopId = stopIds.Contains(currentStopId) ? currentStopId : stopIds[0];
+            BuildEulerianAllStationRoute(stopIds, startStopId, allStationRoute);
+            allStationRunComplete = allStationRoute.Count <= 1;
+        }
+
+        private void AlignAllStationCursor(int currentStopId)
+        {
+            if (allStationRoute.Count == 0 ||
+                allStationRunComplete ||
+                allStationRouteCursor < allStationRoute.Count &&
+                allStationRoute[allStationRouteCursor] == currentStopId)
+            {
+                return;
+            }
+
+            for (int index = Mathf.Max(0, allStationRouteCursor); index < allStationRoute.Count; index++)
+            {
+                if (allStationRoute[index] == currentStopId)
+                {
+                    allStationRouteCursor = index;
+                    allStationRunComplete = allStationRouteCursor >= allStationRoute.Count - 1;
+                    return;
+                }
+            }
+        }
+
+        private static void BuildEulerianAllStationRoute(List<int> stopIds, int startStopId, List<int> output)
+        {
+            var adjacency = new Dictionary<int, List<int>>();
+            for (int originIndex = 0; originIndex < stopIds.Count; originIndex++)
+            {
+                int originStopId = stopIds[originIndex];
+                var destinations = new List<int>();
+                for (int destinationIndex = 0; destinationIndex < stopIds.Count; destinationIndex++)
+                {
+                    int destinationStopId = stopIds[destinationIndex];
+                    if (destinationStopId != originStopId)
+                    {
+                        destinations.Add(destinationStopId);
+                    }
+                }
+
+                adjacency[originStopId] = destinations;
+            }
+
+            var stack = new Stack<int>();
+            var reversedPath = new List<int>();
+            stack.Push(startStopId);
+
+            while (stack.Count > 0)
+            {
+                int currentStopId = stack.Peek();
+                List<int> destinations = adjacency[currentStopId];
+                if (destinations.Count > 0)
+                {
+                    int nextStopId = destinations[0];
+                    destinations.RemoveAt(0);
+                    stack.Push(nextStopId);
+                    continue;
+                }
+
+                reversedPath.Add(stack.Pop());
+            }
+
+            for (int index = reversedPath.Count - 1; index >= 0; index--)
+            {
+                output.Add(reversedPath[index]);
+            }
+        }
+
+        private static string BuildAllStationRouteSignature(IReadOnlyList<DRTStop> stops)
+        {
+            List<int> stopIds = GetSortedStopIds(stops);
+            var builder = new StringBuilder();
+            for (int i = 0; i < stopIds.Count; i++)
+            {
+                if (i > 0)
+                {
+                    builder.Append('|');
+                }
+
+                builder.Append(stopIds[i]);
+            }
+
+            return builder.ToString();
+        }
+
+        private static List<int> GetSortedStopIds(IReadOnlyList<DRTStop> stops)
+        {
+            var stopIds = new List<int>();
+            if (stops == null)
+            {
+                return stopIds;
+            }
+
+            for (int i = 0; i < stops.Count; i++)
+            {
+                if (stops[i] != null && !stopIds.Contains(stops[i].StopId))
+                {
+                    stopIds.Add(stops[i].StopId);
+                }
+            }
+
+            stopIds.Sort();
+            return stopIds;
         }
 
         private static int GetNextSequentialStopId(int currentStopId, IReadOnlyList<DRTStop> stops)

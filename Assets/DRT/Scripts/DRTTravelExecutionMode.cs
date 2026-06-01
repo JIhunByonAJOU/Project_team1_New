@@ -20,6 +20,9 @@ namespace DRT
         ONNXInference,
 
         [InspectorName("Vanilla Sequential")]
-        VanillaSequential
+        VanillaSequential,
+
+        [InspectorName("All Station Runner")]
+        AllStationRunner
     }
 }

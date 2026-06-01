@@ -48,10 +48,8 @@ namespace DRT
         [InspectorName("Mode")]
         [SerializeField] private DRTTravelExecutionMode travelExecutionMode = DRTTravelExecutionMode.MatrixTeleport;
         [SerializeField, InspectorName("Matrix Resource")] private string travelTimeMatrixResourceName = "drt_stop_travel_time_matrix";
-        [SerializeField, InspectorName("Matrix Speed")] private float matrixNominalSpeedMetersPerSecond = 15f;
-        [HideInInspector, SerializeField] private bool preferGeneratedMatrixFromGley = true;
-        [HideInInspector, SerializeField] private bool autoGenerateMatrixFromGleyWhenMissing = true;
-        [HideInInspector, SerializeField] private bool saveGeneratedMatrixAssetInEditor;
+        [Tooltip("Only used to estimate matrix-mode distance in exports. Matrix travel time is read directly from the CSV.")]
+        [HideInInspector, SerializeField] private float matrixNominalSpeedMetersPerSecond = 15f;
         [Tooltip("Suppresses routine Unity logs while Matrix Teleport is active. Applies to training, ONNX inference, and vanilla policies.")]
         [HideInInspector, SerializeField] private bool suppressUnityLogsDuringMatrixTraining = true;
 
@@ -121,7 +119,6 @@ namespace DRT
         private readonly List<DRTRouteLegRecord> routeLegRecords = new List<DRTRouteLegRecord>();
         private readonly List<DRTVehicleTraceRecord> vehicleTraceRecords = new List<DRTVehicleTraceRecord>();
         private DRTRouteLegRecord activeRouteLeg;
-        private float nextVehicleTraceSampleTime;
         private bool episodeCsvExported;
         private float nextMovementDiagnosticTime;
         private Vector3 lastVehicleMovementPosition;
@@ -135,6 +132,9 @@ namespace DRT
         private bool hasTravelDistanceSample;
         private bool travelTimeMatrixLoadAttempted;
         private int episodeIndex;
+        private DateTime episodeExportRunTimestamp;
+        private bool hasEpisodeExportRunTimestamp;
+        private bool allStationMatrixCsvExported;
 
         public float EpisodeTimeSeconds => episodeTimeSeconds;
         public bool IsInitialized => initialized;
@@ -154,6 +154,7 @@ namespace DRT
         public float VehicleSpeedMS => GetVehicleSpeedMS();
         public float TargetDistanceMeters => GetTargetDistanceMeters();
         public float EpisodeLengthSeconds => episodeLengthSeconds;
+        public float SimulationSecondsPerRealSecond => simulationSecondsPerRealSecond;
         public float EpisodeTravelDistanceMeters => episodeTravelDistanceMeters;
         public string TargetStopObjectName => TryGetStop(targetStopId, out DRTStop stop) ? stop.name : "-";
         public bool BackgroundTrafficEnabled => backgroundTrafficEnabled;
@@ -163,6 +164,7 @@ namespace DRT
         public DRTNextStopPolicy NextStopPolicy => nextStopSelector != null ? nextStopSelector.NextStopPolicy : DRTNextStopPolicy.MLAgentsTraining;
         public string NextStopPolicyName => nextStopSelector != null ? nextStopSelector.NextStopPolicyName : "-";
         public bool UsesMatrixTeleport => travelExecutionMode == DRTTravelExecutionMode.MatrixTeleport;
+        public bool UsesAllStationRunner => nextStopSelector != null && nextStopSelector.UsesAllStationRunner;
         public bool UsesGleyVehicleControl => travelExecutionMode == DRTTravelExecutionMode.PhysicalDrive && useGleyVehicleControlInPhysicalDrive;
         public bool SuppressUnityLogsDuringMatrixTeleport => UsesMatrixTeleport &&
                                                              suppressUnityLogsDuringMatrixTraining;
@@ -190,8 +192,15 @@ namespace DRT
             ResolveControlledVehicle(false);
         }
 
+        [ContextMenu("Run All Station Travel Time Calibration")]
+        public void RunAllStationTravelTimeCalibration()
+        {
+            Debug.LogWarning("[BUSCONTROLLER] Select Next Stop Policy = All Station Runner, Travel Execution Mode = Physical Drive, then run Play Mode.");
+        }
+
         private void Awake()
         {
+            EnsureEpisodeExportRunTimestamp();
             ResolveReferences();
             LoadStops(false);
             WirePassengerManager();
@@ -284,7 +293,7 @@ namespace DRT
                 return;
             }
 
-            if (episodeTimeSeconds >= episodeLengthSeconds)
+            if (!UsesAllStationRunner && episodeTimeSeconds >= episodeLengthSeconds)
             {
                 FinishEpisode("Episode time ended.");
             }
@@ -623,6 +632,175 @@ namespace DRT
             ResetLegSafetyState(GetControlledVehicleBodyPosition());
         }
 
+        public bool PrepareAllStationCalibration(bool disableBackgroundTraffic, out string error)
+        {
+            error = null;
+
+            ResolveReferences();
+            LoadStops(false);
+            StopEpisodeCoroutines();
+            initialized = false;
+            episodeFinished = true;
+            driving = false;
+            waitingForArrivalProximity = false;
+            targetStopId = 0;
+            currentStopId = startStopId;
+            ClearAssignedPathVisualization();
+
+            if (stops.Count < 2)
+            {
+                error = "At least two DRT stops are required.";
+                return false;
+            }
+
+            if (!API.IsInitialized())
+            {
+                error = "Gley Traffic API is not initialized.";
+                return false;
+            }
+
+            if (!ResolveControlledGleyVehicle(true))
+            {
+                error = $"Gley controlled vehicle not found. vehicleIndex={vehicleIndex}";
+                return false;
+            }
+
+            EnsureBackgroundTrafficStateInitialized();
+            if (disableBackgroundTraffic)
+            {
+                SetBackgroundTrafficEnabled(false);
+            }
+            else
+            {
+                ApplyBackgroundTrafficState();
+            }
+
+            vehicleDriver.StopAndHold(true);
+            ApplyCameraFollow(GetControlledVehicleTransform());
+            ResetLegSafetyState(GetControlledVehicleBodyPosition());
+            ResetTravelDistanceSample(GetControlledVehicleBodyPosition());
+            return true;
+        }
+
+        public bool TeleportCalibrationVehicleToStop(int stopId, out string error)
+        {
+            error = null;
+
+            if (!API.IsInitialized())
+            {
+                error = "Gley Traffic API is not initialized.";
+                return false;
+            }
+
+            if (!TryGetStop(stopId, out DRTStop stop))
+            {
+                error = $"Stop {stopId} was not found.";
+                return false;
+            }
+
+            if (!ResolveControlledGleyVehicle(true))
+            {
+                error = $"Gley controlled vehicle not found. vehicleIndex={vehicleIndex}";
+                return false;
+            }
+
+            Vector3 servicePoint = GetStopServicePoint(stop);
+            Transform controlledTransform = GetControlledVehicleTransform();
+            Quaternion rotation = controlledTransform != null ? controlledTransform.rotation : Quaternion.identity;
+            TrafficWaypoint closestWaypoint = API.GetClosestWaypoint(servicePoint);
+            if (closestWaypoint != null)
+            {
+                rotation = GetWaypointForwardRotation(closestWaypoint, rotation);
+            }
+
+            currentStopId = stopId;
+            targetStopId = 0;
+            driving = false;
+            waitingForArrivalProximity = false;
+            vehicleDriver.TeleportTo(servicePoint, rotation, closestWaypoint != null ? closestWaypoint.ListIndex : -1);
+            vehicleDriver.StopAndHold(true);
+            ApplyCameraFollow(GetControlledVehicleTransform());
+            ResetLegSafetyState(GetControlledVehicleBodyPosition());
+            ResetTravelDistanceSample(GetControlledVehicleBodyPosition());
+            return true;
+        }
+
+        public bool AssignCalibrationRoute(
+            int fromStopId,
+            int toStopId,
+            out int pathWaypointCount,
+            out float plannedPathDistanceMeters,
+            out string error)
+        {
+            pathWaypointCount = 0;
+            plannedPathDistanceMeters = 0f;
+            error = null;
+
+            if (fromStopId == toStopId)
+            {
+                error = "Origin and destination stops are the same.";
+                return false;
+            }
+
+            if (!API.IsInitialized())
+            {
+                error = "Gley Traffic API is not initialized.";
+                return false;
+            }
+
+            if (!TryGetStop(fromStopId, out _) || !TryGetStop(toStopId, out DRTStop destinationStop))
+            {
+                error = $"Stop lookup failed. from={fromStopId}, to={toStopId}";
+                return false;
+            }
+
+            if (!ResolveControlledGleyVehicle(true))
+            {
+                error = $"Gley controlled vehicle not found. vehicleIndex={vehicleIndex}";
+                return false;
+            }
+
+            currentStopId = fromStopId;
+            targetStopId = toStopId;
+            waitingForArrivalProximity = false;
+
+            Vector3 servicePoint = GetStopServicePoint(destinationStop);
+            Vector3 routeStartPoint = GetGleyRouteStartPoint(out _);
+            List<int> path = API.GetPath(routeStartPoint, servicePoint, controlledVehicleType);
+            if (path == null || path.Count == 0)
+            {
+                error = $"Gley path not found. from={fromStopId}, to={toStopId}";
+                return false;
+            }
+
+            if (!vehicleDriver.SetPath(path, servicePoint))
+            {
+                error = $"Controlled vehicle path assignment failed. from={fromStopId}, to={toStopId}";
+                return false;
+            }
+
+            driving = true;
+            UpdateAssignedPathVisualization(routeStartPoint, path, servicePoint);
+            ResetLegSafetyState(GetControlledVehicleBodyPosition());
+            ResetTravelDistanceSample(GetControlledVehicleBodyPosition());
+            pathWaypointCount = path.Count;
+            plannedPathDistanceMeters = assignedPathDistanceMeters;
+            return true;
+        }
+
+        public float GetCalibrationDistanceToStopMeters(int stopId)
+        {
+            return GetDistanceToStopMeters(stopId);
+        }
+
+        public void StopCalibrationVehicle(bool zeroVelocity)
+        {
+            driving = false;
+            waitingForArrivalProximity = false;
+            targetStopId = 0;
+            vehicleDriver?.StopAndHold(zeroVelocity);
+        }
+
         private bool TryGetStartWaypoint(out TrafficWaypoint waypoint)
         {
             waypoint = null;
@@ -771,11 +949,16 @@ namespace DRT
             }
             else
             {
-                nextStopId = nextStopSelector.SelectVanillaSequentialStopId(
-                    currentStopId,
-                    stops,
-                    passengerManager,
-                    episodeTimeSeconds);
+                nextStopId = nextStopSelector.UsesAllStationRunner
+                    ? nextStopSelector.SelectAllStationRunnerStopId(
+                        currentStopId,
+                        stops,
+                        episodeTimeSeconds)
+                    : nextStopSelector.SelectVanillaSequentialStopId(
+                        currentStopId,
+                        stops,
+                        passengerManager,
+                        episodeTimeSeconds);
             }
 
             if (nextStopId < 1 && nextStopSelector.UsesMlAgentsDecisionPolicy)
@@ -948,8 +1131,39 @@ namespace DRT
                 yield break;
             }
 
+            if (AdvanceMatrixDwellAndMaybeFinish())
+            {
+                yield break;
+            }
+
             yield return null;
             SendToNextStop();
+        }
+
+        private bool AdvanceMatrixDwellAndMaybeFinish()
+        {
+            float dwellEpisodeSeconds = GetDwellEpisodeSeconds();
+            if (dwellEpisodeSeconds <= 0f)
+            {
+                return false;
+            }
+
+            episodeTimeSeconds += dwellEpisodeSeconds;
+            AdvanceDemandToCurrentTime();
+            passengerManager?.UpdateRequestStates(episodeTimeSeconds);
+
+            if (episodeTimeSeconds >= episodeLengthSeconds)
+            {
+                FinishEpisode("Episode time ended.");
+                return true;
+            }
+
+            return false;
+        }
+
+        private float GetDwellEpisodeSeconds()
+        {
+            return Mathf.Max(0f, dwellSeconds) * Mathf.Max(0.01f, simulationSecondsPerRealSecond);
         }
 
         private bool ProcessStopArrivalAndMaybeFinish(int reachedStopId)
@@ -970,13 +1184,19 @@ namespace DRT
             CompleteActiveRouteLeg(currentStopId, stopResult);
             nextStopSelector.RecordStopArrival(stopResult, episodeTimeSeconds);
 
-            if (stopWhenAllRequestsCompleted && !HasUnfinishedOrPendingRequests())
+            if (nextStopSelector.IsAllStationRunComplete)
+            {
+                FinishEpisode("All station runner completed.");
+                return true;
+            }
+
+            if (!UsesAllStationRunner && stopWhenAllRequestsCompleted && !HasUnfinishedOrPendingRequests())
             {
                 FinishEpisode("All passenger requests completed.");
                 return true;
             }
 
-            if (episodeTimeSeconds >= episodeLengthSeconds)
+            if (!UsesAllStationRunner && episodeTimeSeconds >= episodeLengthSeconds)
             {
                 FinishEpisode("Episode time ended.");
                 return true;
@@ -1059,8 +1279,8 @@ namespace DRT
             routeLegRecords.Clear();
             vehicleTraceRecords.Clear();
             activeRouteLeg = null;
-            nextVehicleTraceSampleTime = 0f;
             episodeCsvExported = false;
+            allStationMatrixCsvExported = false;
         }
 
         private void TeleportControlledVehicleToStop(DRTStop stop)
@@ -1221,29 +1441,6 @@ namespace DRT
                    travelTimeMatrix.TryGetAverageTravelTimeMinutes(selectedStops, out averageMinutes);
         }
 
-        [ContextMenu("Regenerate DRT Stop Travel Time Matrix CSV")]
-        public void RegenerateTravelTimeMatrixCsv()
-        {
-            ResolveReferences();
-            LoadStops(false);
-
-            if (!API.IsInitialized())
-            {
-                Debug.LogWarning("[BUSCONTROLLER] Gley Traffic API is not initialized. Start Play Mode before regenerating the matrix.");
-                return;
-            }
-
-            if (!TryGenerateTravelTimeMatrixFromGley(out string csvText, out string error))
-            {
-                Debug.LogError($"[BUSCONTROLLER] Travel time matrix generation failed. {error}");
-                return;
-            }
-
-            SaveTravelTimeMatrixCsvAsset(csvText, true);
-            travelTimeMatrixLoadAttempted = false;
-            Debug.Log($"[BUSCONTROLLER] Travel time matrix regenerated. stops={travelTimeMatrix.StopCount}");
-        }
-
         private bool EnsureTravelTimeMatrix()
         {
             if (travelTimeMatrix.IsLoaded)
@@ -1268,20 +1465,6 @@ namespace DRT
 
             travelTimeMatrixLoadAttempted = true;
 
-            if (preferGeneratedMatrixFromGley && API.IsInitialized() && autoGenerateMatrixFromGleyWhenMissing)
-            {
-                if (TryGenerateTravelTimeMatrixFromGley(out string generatedCsvFromGley, out string generatedErrorFromGley))
-                {
-                    SaveTravelTimeMatrixCsvAsset(generatedCsvFromGley, false);
-                    LogInfo(
-                        $"[BUSCONTROLLER] Generated travel time matrix from Gley paths. " +
-                        $"stops={travelTimeMatrix.StopCount}, speed={matrixNominalSpeedMetersPerSecond:0.00}m/s");
-                    return true;
-                }
-
-                Debug.LogWarning($"[BUSCONTROLLER] Preferred Gley travel time matrix generation failed. {generatedErrorFromGley}");
-            }
-
             TextAsset csvAsset = Resources.Load<TextAsset>(travelTimeMatrixResourceName);
             string loadError = null;
             if (csvAsset != null && travelTimeMatrix.LoadFromCsv(csvAsset.text, stops, out loadError))
@@ -1292,60 +1475,20 @@ namespace DRT
                 return true;
             }
 
-            if (csvAsset != null)
+            if (csvAsset == null)
             {
-                Debug.LogWarning($"[BUSCONTROLLER] Travel time matrix CSV invalid. {loadError}");
-            }
-
-            if (!autoGenerateMatrixFromGleyWhenMissing)
-            {
-                Debug.LogError($"[BUSCONTROLLER] Travel time matrix unavailable. resource={travelTimeMatrixResourceName}");
+                Debug.LogError($"[BUSCONTROLLER] Travel time matrix resource not found. resource={travelTimeMatrixResourceName}");
                 return false;
             }
 
-            if (!TryGenerateTravelTimeMatrixFromGley(out string generatedCsv, out string generationError))
-            {
-                Debug.LogError($"[BUSCONTROLLER] Travel time matrix auto-generation failed. {generationError}");
-                return false;
-            }
-
-            SaveTravelTimeMatrixCsvAsset(generatedCsv, false);
-            LogInfo(
-                $"[BUSCONTROLLER] Generated travel time matrix from Gley paths. " +
-                $"stops={travelTimeMatrix.StopCount}, speed={matrixNominalSpeedMetersPerSecond:0.00}m/s");
-            return true;
+            Debug.LogError($"[BUSCONTROLLER] Travel time matrix CSV invalid. resource={travelTimeMatrixResourceName}, error={loadError}");
+            return false;
         }
 
-        private bool TryGenerateTravelTimeMatrixFromGley(out string csvText, out string error)
+        public void InvalidateTravelTimeMatrix()
         {
-            return travelTimeMatrix.GenerateFromGleyPaths(
-                stops,
-                GetStopServicePoint,
-                controlledVehicleType,
-                matrixNominalSpeedMetersPerSecond,
-                out csvText,
-                out error);
-        }
-
-        private void SaveTravelTimeMatrixCsvAsset(string csvText, bool force)
-        {
-#if UNITY_EDITOR
-            if (!force && !saveGeneratedMatrixAssetInEditor)
-            {
-                return;
-            }
-
-            string resourcesPath = System.IO.Path.Combine(Application.dataPath, "DRT", "Resources");
-            Directory.CreateDirectory(resourcesPath);
-
-            string fileName = string.IsNullOrWhiteSpace(travelTimeMatrixResourceName)
-                ? "drt_stop_travel_time_matrix"
-                : travelTimeMatrixResourceName;
-            string csvPath = System.IO.Path.Combine(resourcesPath, fileName + ".csv");
-            File.WriteAllText(csvPath, csvText);
-            AssetDatabase.Refresh();
-            Debug.Log($"[BUSCONTROLLER] Saved travel time matrix CSV to {csvPath}");
-#endif
+            travelTimeMatrix.Clear();
+            travelTimeMatrixLoadAttempted = false;
         }
 
         private void LogRouteDiagnostics(DRTStop stop, Vector3 servicePoint)
@@ -1723,18 +1866,7 @@ namespace DRT
 
         private void RecordVehicleTraceIfNeeded()
         {
-            if (!ShouldCollectEpisodeExportData() || vehicleTraceSampleIntervalSeconds <= 0f)
-            {
-                return;
-            }
-
-            if (episodeTimeSeconds + 0.0001f < nextVehicleTraceSampleTime)
-            {
-                return;
-            }
-
-            RecordVehicleTrace("sample");
-            nextVehicleTraceSampleTime = episodeTimeSeconds + vehicleTraceSampleIntervalSeconds;
+            // Route analysis exports are stop/leg based. Per-second samples add noise and are not persisted.
         }
 
         private void RecordVehicleTrace(string eventName)
@@ -1901,7 +2033,9 @@ namespace DRT
                 return;
             }
 
-            bool completedAllRequests = !HasUnfinishedOrPendingRequests();
+            bool completedAllRequests = UsesAllStationRunner
+                ? nextStopSelector != null && nextStopSelector.IsAllStationRunComplete
+                : !HasUnfinishedOrPendingRequests();
             episodeFinished = true;
             driving = false;
             waitingForArrivalProximity = false;
@@ -1921,6 +2055,7 @@ namespace DRT
             float serviceRate = passengerManager != null ? passengerManager.GetServiceRate() : 0f;
             int completedCount = passengerManager != null ? passengerManager.GetCompletedCount() : 0;
             ExportEpisodeCsvIfNeeded(reason, completedAllRequests);
+            ExportAllStationMatrixCsvIfNeeded(reason);
 
             nextStopSelector?.NotifyEpisodeFinished(
                 completedAllRequests,
@@ -1942,22 +2077,20 @@ namespace DRT
 
             try
             {
+                DateTime exportTimestamp = DateTime.Now;
                 string exportDirectory = GetEpisodeExportDirectory();
                 Directory.CreateDirectory(exportDirectory);
 
-                string prefix = BuildEpisodeExportPrefix();
-                string passengerPath = System.IO.Path.Combine(exportDirectory, $"{prefix}_passengers.csv");
-                string routePath = System.IO.Path.Combine(exportDirectory, $"{prefix}_route_legs.csv");
-                string tracePath = System.IO.Path.Combine(exportDirectory, $"{prefix}_vehicle_trace.csv");
-                string summaryPath = System.IO.Path.Combine(exportDirectory, $"{prefix}_summary.csv");
-
-                File.WriteAllText(passengerPath, BuildPassengerCsv(), Encoding.UTF8);
-                File.WriteAllText(routePath, BuildRouteLegCsv(), Encoding.UTF8);
-                File.WriteAllText(tracePath, BuildVehicleTraceCsv(), Encoding.UTF8);
-                File.WriteAllText(summaryPath, BuildSummaryCsv(finishReason, completedAllRequests), Encoding.UTF8);
+                string fileStem = BuildEpisodeExportFileStem();
+                string episodeFileName = $"{fileStem}_episode.csv";
+                string traceFileName = $"{fileStem}_trace.csv";
+                string episodePath = System.IO.Path.Combine(exportDirectory, episodeFileName);
+                string tracePath = System.IO.Path.Combine(exportDirectory, traceFileName);
+                File.WriteAllText(episodePath, BuildEpisodeCsv(finishReason, completedAllRequests, exportTimestamp), Encoding.UTF8);
+                File.WriteAllText(tracePath, BuildTraceCsv(), Encoding.UTF8);
 
                 LogInfo(
-                    $"[BUSCONTROLLER] Episode CSV exported. prefix={prefix}, " +
+                    $"[BUSCONTROLLER] Episode CSV exported. episode={episodeFileName}, trace={traceFileName}, " +
                     $"directory={exportDirectory}");
             }
             catch (Exception exception)
@@ -1966,9 +2099,158 @@ namespace DRT
             }
         }
 
+        private void ExportAllStationMatrixCsvIfNeeded(string finishReason)
+        {
+            if (allStationMatrixCsvExported || !UsesAllStationRunner)
+            {
+                return;
+            }
+
+            allStationMatrixCsvExported = true;
+
+            if (travelExecutionMode != DRTTravelExecutionMode.PhysicalDrive)
+            {
+                Debug.LogWarning("[BUSCONTROLLER] All Station Runner finished, but matrix CSV was not updated because travel mode is not Physical Drive.");
+                return;
+            }
+
+            if (nextStopSelector == null || !nextStopSelector.IsAllStationRunComplete)
+            {
+                Debug.LogWarning($"[BUSCONTROLLER] All Station Runner matrix CSV skipped. run did not complete. reason={finishReason}");
+                return;
+            }
+
+            if (!TryBuildAllStationMatrixCsv(out string matrixCsv, out string samplesCsv, out string buildError))
+            {
+                Debug.LogError($"[BUSCONTROLLER] All Station Runner matrix CSV skipped. {buildError}");
+                return;
+            }
+
+            try
+            {
+                string resourcesPath = System.IO.Path.Combine(Application.dataPath, "DRT", "Resources");
+                Directory.CreateDirectory(resourcesPath);
+
+                string fileName = string.IsNullOrWhiteSpace(travelTimeMatrixResourceName)
+                    ? "drt_stop_travel_time_matrix"
+                    : travelTimeMatrixResourceName;
+                string matrixPath = System.IO.Path.Combine(resourcesPath, fileName + ".csv");
+                File.WriteAllText(matrixPath, matrixCsv, new UTF8Encoding(false));
+
+                string exportDirectory = GetEpisodeExportDirectory();
+                Directory.CreateDirectory(exportDirectory);
+                string samplesPath = System.IO.Path.Combine(exportDirectory, $"{BuildEpisodeExportFileStem()}_matrix_samples.csv");
+                File.WriteAllText(samplesPath, samplesCsv, Encoding.UTF8);
+
+#if UNITY_EDITOR
+                AssetDatabase.Refresh();
+#endif
+
+                InvalidateTravelTimeMatrix();
+                Debug.Log(
+                    $"[BUSCONTROLLER] All Station Runner matrix CSV exported. " +
+                    $"matrix={matrixPath}, samples={samplesPath}");
+            }
+            catch (Exception exception)
+            {
+                Debug.LogError($"[BUSCONTROLLER] Failed to export All Station Runner matrix CSV. {exception}");
+            }
+        }
+
+        private bool TryBuildAllStationMatrixCsv(out string matrixCsv, out string samplesCsv, out string error)
+        {
+            matrixCsv = string.Empty;
+            samplesCsv = string.Empty;
+            error = null;
+
+            var sortedStops = stops
+                .Where(stop => stop != null)
+                .OrderBy(stop => stop.StopId)
+                .ToList();
+            if (sortedStops.Count < 2)
+            {
+                error = "At least two stops are required.";
+                return false;
+            }
+
+            var samplesByPair = new Dictionary<string, List<float>>();
+            for (int i = 0; i < routeLegRecords.Count; i++)
+            {
+                DRTRouteLegRecord leg = routeLegRecords[i];
+                if (leg == null ||
+                    !leg.Completed ||
+                    leg.FromStopId <= 0 ||
+                    leg.ToStopId <= 0 ||
+                    leg.FromStopId == leg.ToStopId ||
+                    leg.ArrivedStopId != leg.ToStopId ||
+                    leg.TravelTimeSeconds <= 0f)
+                {
+                    continue;
+                }
+
+                string key = BuildStopPairKey(leg.FromStopId, leg.ToStopId);
+                if (!samplesByPair.TryGetValue(key, out List<float> samples))
+                {
+                    samples = new List<float>();
+                    samplesByPair[key] = samples;
+                }
+
+                samples.Add(leg.TravelTimeSeconds);
+            }
+
+            var matrixBuilder = new StringBuilder();
+            var samplesBuilder = new StringBuilder();
+            samplesBuilder.AppendLine("from_stop_id,to_stop_id,sample_count,matrix_time_seconds,sample_time_seconds");
+
+            for (int row = 0; row < sortedStops.Count; row++)
+            {
+                if (row > 0)
+                {
+                    matrixBuilder.AppendLine();
+                }
+
+                int fromStopId = sortedStops[row].StopId;
+                for (int column = 0; column < sortedStops.Count; column++)
+                {
+                    if (column > 0)
+                    {
+                        matrixBuilder.Append(',');
+                    }
+
+                    int toStopId = sortedStops[column].StopId;
+                    if (fromStopId == toStopId)
+                    {
+                        matrixBuilder.Append('0');
+                        continue;
+                    }
+
+                    string key = BuildStopPairKey(fromStopId, toStopId);
+                    if (!samplesByPair.TryGetValue(key, out List<float> samples) || samples.Count == 0)
+                    {
+                        error = $"Missing completed route leg sample. from={fromStopId}, to={toStopId}";
+                        return false;
+                    }
+
+                    float matrixSeconds = Median(samples);
+                    matrixBuilder.Append(FormatCsvFloat(matrixSeconds));
+                    samplesBuilder
+                        .Append(fromStopId.ToString(CultureInfo.InvariantCulture)).Append(',')
+                        .Append(toStopId.ToString(CultureInfo.InvariantCulture)).Append(',')
+                        .Append(samples.Count.ToString(CultureInfo.InvariantCulture)).Append(',')
+                        .Append(FormatCsvFloat(matrixSeconds)).Append(',')
+                        .Append(CsvEscape(FormatCsvFloatList(samples)))
+                        .AppendLine();
+                }
+            }
+
+            matrixCsv = matrixBuilder.ToString();
+            samplesCsv = samplesBuilder.ToString();
+            return true;
+        }
+
         private bool ShouldCollectEpisodeExportData()
         {
-            return exportEpisodeCsvOnEpisodeEnd && !IsMlAgentsTrainingSession();
+            return exportEpisodeCsvOnEpisodeEnd;
         }
 
         private static bool IsMlAgentsTrainingSession()
@@ -1976,7 +2258,7 @@ namespace DRT
             return Academy.Instance != null && Academy.Instance.IsCommunicatorOn;
         }
 
-        private string GetEpisodeExportDirectory()
+        private string GetEpisodeExportRootDirectory()
         {
 #if UNITY_EDITOR
             string projectRoot = System.IO.Path.GetFullPath(System.IO.Path.Combine(Application.dataPath, ".."));
@@ -1986,22 +2268,40 @@ namespace DRT
 #endif
         }
 
-        private string BuildEpisodeExportPrefix()
+        private string GetEpisodeExportDirectory()
+        {
+            EnsureEpisodeExportRunTimestamp();
+            string policyDirectory = GetNextStopPolicyExportToken();
+            string timestampDirectory = episodeExportRunTimestamp.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture);
+            return System.IO.Path.Combine(GetEpisodeExportRootDirectory(), policyDirectory, timestampDirectory);
+        }
+
+        private void EnsureEpisodeExportRunTimestamp()
+        {
+            if (hasEpisodeExportRunTimestamp)
+            {
+                return;
+            }
+
+            episodeExportRunTimestamp = DateTime.Now;
+            hasEpisodeExportRunTimestamp = true;
+        }
+
+        private string BuildEpisodeExportFileStem()
         {
             string modeToken = GetTravelExecutionExportToken();
             string policyToken = GetNextStopPolicyExportToken();
             string scenarioId = demandGenerator != null
                 ? demandGenerator.ExportScenarioId
                 : Mathf.Max(0, passengerManager != null ? passengerManager.Requests.Count : 0).ToString(CultureInfo.InvariantCulture);
-            string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture);
-            return SanitizeFileName($"drt_{modeToken}_{policyToken}_scenario_{scenarioId}_ep{episodeIndex:000}_{timestamp}");
+            return SanitizeFileName($"drt_{modeToken}_{policyToken}_scenario_{scenarioId}_ep{episodeIndex:000}");
         }
 
         private string GetTravelExecutionExportToken()
         {
             return travelExecutionMode == DRTTravelExecutionMode.PhysicalDrive
-                ? "physical_drive"
-                : "matrix_teleport";
+                ? "physical"
+                : "matrix";
         }
 
         private string GetNextStopPolicyExportToken()
@@ -2009,48 +2309,52 @@ namespace DRT
             switch (NextStopPolicy)
             {
                 case DRTNextStopPolicy.ONNXInference:
-                    return "onnx_inference";
+                    return "inference";
                 case DRTNextStopPolicy.VanillaSequential:
-                    return "vanilla_sequential";
+                    return "vanilla";
+                case DRTNextStopPolicy.AllStationRunner:
+                    return "all_station";
                 default:
-                    return "ml_agents_training";
+                    return "train";
             }
         }
 
-        private string BuildPassengerCsv()
+        private string BuildEpisodeCsv(string finishReason, bool completedAllRequests, DateTime exportTimestamp)
         {
             var builder = new StringBuilder();
-            builder.AppendLine("passenger_id,origin_stop_id,destination_stop_id,request_time_seconds,status,pickup_time_seconds,dropoff_time_seconds,actual_pickup_stop_id,actual_dropoff_stop_id,wait_time_seconds,ride_time_seconds,total_service_time_seconds");
-
-            foreach (var request in passengerManager.Requests.OrderBy(request => request.PassengerId))
-            {
-                builder
-                    .Append(request.PassengerId.ToString(CultureInfo.InvariantCulture)).Append(',')
-                    .Append(request.OriginStopId.ToString(CultureInfo.InvariantCulture)).Append(',')
-                    .Append(request.DestinationStopId.ToString(CultureInfo.InvariantCulture)).Append(',')
-                    .Append(FormatCsvFloat(request.RequestTimeSeconds)).Append(',')
-                    .Append(CsvEscape(request.Status.ToString())).Append(',')
-                    .Append(FormatCsvFloatOrBlank(request.PickupTimeSeconds)).Append(',')
-                    .Append(FormatCsvFloatOrBlank(request.DropoffTimeSeconds)).Append(',')
-                    .Append(FormatCsvIntOrBlank(request.ActualPickupStopId)).Append(',')
-                    .Append(FormatCsvIntOrBlank(request.ActualDropoffStopId)).Append(',')
-                    .Append(FormatCsvFloat(request.GetWaitTime(episodeTimeSeconds))).Append(',')
-                    .Append(FormatCsvFloat(request.GetRideTime(episodeTimeSeconds))).Append(',')
-                    .Append(FormatCsvFloat(request.GetTotalServiceTime(episodeTimeSeconds)))
-                    .AppendLine();
-            }
-
+            builder.AppendLine("section,key,value");
+            AppendEpisodeRow(builder, "metadata", "schema_version", "1");
+            AppendEpisodeRow(builder, "metadata", "generated_at", exportTimestamp.ToString("o", CultureInfo.InvariantCulture));
+            AppendEpisodeRow(builder, "summary", "episode_index", episodeIndex.ToString(CultureInfo.InvariantCulture));
+            AppendEpisodeRow(builder, "summary", "travel_mode", GetTravelExecutionExportToken());
+            AppendEpisodeRow(builder, "summary", "travel_execution_mode", TravelExecutionModeName);
+            AppendEpisodeRow(builder, "summary", "policy", GetNextStopPolicyExportToken());
+            AppendEpisodeRow(builder, "summary", "next_stop_policy", NextStopPolicyName);
+            AppendEpisodeRow(builder, "summary", "scenario_id", demandGenerator != null ? demandGenerator.ExportScenarioId : string.Empty);
+            AppendEpisodeRow(builder, "summary", "scenario_description", demandGenerator != null ? demandGenerator.LoadedScenarioDescription : string.Empty);
+            AppendEpisodeRow(builder, "summary", "finish_reason", finishReason);
+            AppendEpisodeRow(builder, "summary", "completed_all_requests", completedAllRequests ? "1" : "0");
+            AppendEpisodeRow(builder, "summary", "episode_time_seconds", FormatCsvFloat(episodeTimeSeconds));
+            AppendEpisodeRow(builder, "summary", "episode_distance_meters", FormatCsvFloat(episodeTravelDistanceMeters));
+            AppendEpisodeRow(builder, "summary", "total_passengers", passengerManager != null ? passengerManager.Requests.Count.ToString(CultureInfo.InvariantCulture) : "0");
+            AppendEpisodeRow(builder, "summary", "completed_passengers", passengerManager != null ? passengerManager.GetCompletedCount().ToString(CultureInfo.InvariantCulture) : "0");
+            AppendEpisodeRow(builder, "summary", "service_rate", passengerManager != null ? FormatCsvFloat(passengerManager.GetServiceRate()) : "0");
+            AppendEpisodeRow(builder, "summary", "average_wait_seconds", passengerManager != null ? FormatCsvFloat(passengerManager.GetAverageConfirmedWaitTime()) : "0");
+            AppendEpisodeRow(builder, "summary", "average_ride_seconds", passengerManager != null ? FormatCsvFloat(passengerManager.GetAverageCompletedRideTime()) : "0");
+            builder.AppendLine(",");
+            AppendRouteLegsCsv(builder);
+            builder.AppendLine(",");
+            AppendPassengersCsv(builder);
             return builder.ToString();
         }
 
-        private string BuildRouteLegCsv()
+        private void AppendRouteLegsCsv(StringBuilder builder)
         {
-            var builder = new StringBuilder();
-            builder.AppendLine("leg_index,mode,from_stop_id,to_stop_id,arrived_stop_id,completed,departure_time_seconds,arrival_time_seconds,travel_time_seconds,leg_distance_meters,cumulative_distance_meters,planned_path_distance_meters,path_waypoint_count,boarded_count,dropped_off_count,waiting_count,on_board_count,completed_passenger_count");
-
+            builder.AppendLine("section,leg_index,mode,from_stop_id,to_stop_id,arrived_stop_id,completed,departure_time_seconds,arrival_time_seconds,travel_time_seconds,leg_distance_meters,cumulative_distance_meters,planned_path_distance_meters,path_waypoint_count,boarded_count,dropped_off_count,boarded_passenger_ids,dropped_off_passenger_ids,waiting_count,on_board_count,completed_passenger_count");
             foreach (var leg in routeLegRecords)
             {
                 builder
+                    .Append("route_leg").Append(',')
                     .Append(leg.LegIndex.ToString(CultureInfo.InvariantCulture)).Append(',')
                     .Append(CsvEscape(leg.Mode)).Append(',')
                     .Append(leg.FromStopId.ToString(CultureInfo.InvariantCulture)).Append(',')
@@ -2066,70 +2370,130 @@ namespace DRT
                     .Append(leg.PathWaypointCount.ToString(CultureInfo.InvariantCulture)).Append(',')
                     .Append(leg.BoardedCount.ToString(CultureInfo.InvariantCulture)).Append(',')
                     .Append(leg.DroppedOffCount.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(CsvEscape(FormatPassengerIdList(GetBoardedPassengerIds(leg)))).Append(',')
+                    .Append(CsvEscape(FormatPassengerIdList(GetDroppedOffPassengerIds(leg)))).Append(',')
                     .Append(leg.WaitingCount.ToString(CultureInfo.InvariantCulture)).Append(',')
                     .Append(leg.OnBoardCount.ToString(CultureInfo.InvariantCulture)).Append(',')
                     .Append(leg.CompletedPassengerCount.ToString(CultureInfo.InvariantCulture))
                     .AppendLine();
             }
-
-            return builder.ToString();
         }
 
-        private string BuildVehicleTraceCsv()
+        private void AppendPassengersCsv(StringBuilder builder)
         {
-            var builder = new StringBuilder();
-            builder.AppendLine("sample_index,event,episode_time_seconds,current_stop_id,target_stop_id,x,y,z,cumulative_distance_meters,speed_mps,blocked,block_reason");
-
-            foreach (var trace in vehicleTraceRecords)
+            builder.AppendLine("section,passenger_id,origin_stop_id,destination_stop_id,request_time_seconds,status,pickup_time_seconds,dropoff_time_seconds,actual_pickup_stop_id,actual_dropoff_stop_id,wait_time_seconds,ride_time_seconds,total_service_time_seconds");
+            foreach (var request in passengerManager.Requests.OrderBy(request => request.PassengerId))
             {
                 builder
-                    .Append(trace.SampleIndex.ToString(CultureInfo.InvariantCulture)).Append(',')
-                    .Append(CsvEscape(trace.EventName)).Append(',')
-                    .Append(FormatCsvFloat(trace.EpisodeTimeSeconds)).Append(',')
-                    .Append(FormatCsvIntOrBlank(trace.CurrentStopId)).Append(',')
-                    .Append(FormatCsvIntOrBlank(trace.TargetStopId)).Append(',')
-                    .Append(FormatCsvFloat(trace.Position.x)).Append(',')
-                    .Append(FormatCsvFloat(trace.Position.y)).Append(',')
-                    .Append(FormatCsvFloat(trace.Position.z)).Append(',')
-                    .Append(FormatCsvFloat(trace.CumulativeDistanceMeters)).Append(',')
-                    .Append(FormatCsvFloat(trace.SpeedMetersPerSecond)).Append(',')
-                    .Append(trace.Blocked ? "1" : "0").Append(',')
-                    .Append(CsvEscape(trace.BlockReason))
+                    .Append("passenger").Append(',')
+                    .Append(request.PassengerId.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(request.OriginStopId.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(request.DestinationStopId.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(FormatCsvFloat(request.RequestTimeSeconds)).Append(',')
+                    .Append(CsvEscape(request.Status.ToString())).Append(',')
+                    .Append(FormatCsvFloatOrBlank(request.PickupTimeSeconds)).Append(',')
+                    .Append(FormatCsvFloatOrBlank(request.DropoffTimeSeconds)).Append(',')
+                    .Append(FormatCsvIntOrBlank(request.ActualPickupStopId)).Append(',')
+                    .Append(FormatCsvIntOrBlank(request.ActualDropoffStopId)).Append(',')
+                    .Append(FormatCsvFloat(request.GetWaitTime(episodeTimeSeconds))).Append(',')
+                    .Append(FormatCsvFloat(request.GetRideTime(episodeTimeSeconds))).Append(',')
+                    .Append(FormatCsvFloat(request.GetTotalServiceTime(episodeTimeSeconds)))
+                    .AppendLine();
+            }
+        }
+
+        private string BuildTraceCsv()
+        {
+            var builder = new StringBuilder();
+            builder.AppendLine("leg_index,from_stop_id,to_stop_id,arrived_stop_id,completed,departure_time_seconds,arrival_time_seconds,travel_time_seconds,leg_distance_meters,cumulative_distance_meters,planned_path_distance_meters,path_waypoint_count,boarded_passenger_ids,dropped_off_passenger_ids,arrival_x,arrival_y,arrival_z,blocked,block_reason");
+
+            foreach (var leg in routeLegRecords)
+            {
+                DRTVehicleTraceRecord arrivalTrace = FindNearestVehicleTrace(leg.ArrivalTimeSeconds);
+                builder
+                    .Append(leg.LegIndex.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(leg.FromStopId.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(leg.ToStopId.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(FormatCsvIntOrBlank(leg.ArrivedStopId)).Append(',')
+                    .Append(leg.Completed ? "1" : "0").Append(',')
+                    .Append(FormatCsvFloat(leg.DepartureTimeSeconds)).Append(',')
+                    .Append(FormatCsvFloat(leg.ArrivalTimeSeconds)).Append(',')
+                    .Append(FormatCsvFloat(leg.TravelTimeSeconds)).Append(',')
+                    .Append(FormatCsvFloat(leg.LegDistanceMeters)).Append(',')
+                    .Append(FormatCsvFloat(leg.ArrivalCumulativeDistanceMeters)).Append(',')
+                    .Append(FormatCsvFloat(leg.PlannedPathDistanceMeters)).Append(',')
+                    .Append(leg.PathWaypointCount.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(CsvEscape(FormatPassengerIdList(GetBoardedPassengerIds(leg)))).Append(',')
+                    .Append(CsvEscape(FormatPassengerIdList(GetDroppedOffPassengerIds(leg)))).Append(',')
+                    .Append(arrivalTrace != null ? FormatCsvFloat(arrivalTrace.Position.x) : string.Empty).Append(',')
+                    .Append(arrivalTrace != null ? FormatCsvFloat(arrivalTrace.Position.y) : string.Empty).Append(',')
+                    .Append(arrivalTrace != null ? FormatCsvFloat(arrivalTrace.Position.z) : string.Empty).Append(',')
+                    .Append(arrivalTrace != null && arrivalTrace.Blocked ? "1" : "0").Append(',')
+                    .Append(CsvEscape(arrivalTrace != null ? arrivalTrace.BlockReason : string.Empty))
                     .AppendLine();
             }
 
             return builder.ToString();
         }
 
-        private string BuildSummaryCsv(string finishReason, bool completedAllRequests)
+        private DRTVehicleTraceRecord FindNearestVehicleTrace(float episodeTime)
         {
-            var builder = new StringBuilder();
-            builder.AppendLine("key,value");
-            AppendSummaryRow(builder, "episode_index", episodeIndex.ToString(CultureInfo.InvariantCulture));
-            AppendSummaryRow(builder, "mode", GetTravelExecutionExportToken());
-            AppendSummaryRow(builder, "travel_execution_mode", TravelExecutionModeName);
-            AppendSummaryRow(builder, "next_stop_policy", NextStopPolicyName);
-            AppendSummaryRow(builder, "scenario_id", demandGenerator != null ? demandGenerator.ExportScenarioId : string.Empty);
-            AppendSummaryRow(builder, "scenario_description", demandGenerator != null ? demandGenerator.LoadedScenarioDescription : string.Empty);
-            AppendSummaryRow(builder, "finish_reason", finishReason);
-            AppendSummaryRow(builder, "completed_all_requests", completedAllRequests ? "1" : "0");
-            AppendSummaryRow(builder, "episode_time_seconds", FormatCsvFloat(episodeTimeSeconds));
-            AppendSummaryRow(builder, "episode_distance_meters", FormatCsvFloat(episodeTravelDistanceMeters));
-            AppendSummaryRow(builder, "total_passengers", passengerManager != null ? passengerManager.Requests.Count.ToString(CultureInfo.InvariantCulture) : "0");
-            AppendSummaryRow(builder, "completed_passengers", passengerManager != null ? passengerManager.GetCompletedCount().ToString(CultureInfo.InvariantCulture) : "0");
-            AppendSummaryRow(builder, "service_rate", passengerManager != null ? FormatCsvFloat(passengerManager.GetServiceRate()) : "0");
-            AppendSummaryRow(builder, "average_wait_seconds", passengerManager != null ? FormatCsvFloat(passengerManager.GetAverageConfirmedWaitTime()) : "0");
-            AppendSummaryRow(builder, "average_ride_seconds", passengerManager != null ? FormatCsvFloat(passengerManager.GetAverageCompletedRideTime()) : "0");
-            return builder.ToString();
+            if (vehicleTraceRecords.Count == 0)
+            {
+                return null;
+            }
+
+            DRTVehicleTraceRecord nearestTrace = null;
+            float nearestDelta = float.PositiveInfinity;
+            for (int i = 0; i < vehicleTraceRecords.Count; i++)
+            {
+                DRTVehicleTraceRecord trace = vehicleTraceRecords[i];
+                float delta = Mathf.Abs(trace.EpisodeTimeSeconds - episodeTime);
+                if (delta < nearestDelta)
+                {
+                    nearestTrace = trace;
+                    nearestDelta = delta;
+                }
+            }
+
+            return nearestTrace;
         }
 
-        private static void AppendSummaryRow(StringBuilder builder, string key, string value)
+        private List<int> GetBoardedPassengerIds(DRTRouteLegRecord leg)
         {
-            builder
-                .Append(CsvEscape(key))
-                .Append(',')
-                .Append(CsvEscape(value))
-                .AppendLine();
+            if (passengerManager == null || leg.ArrivedStopId <= 0)
+            {
+                return new List<int>();
+            }
+
+            return passengerManager.Requests
+                .Where(request => request != null &&
+                                  request.ActualPickupStopId == leg.ArrivedStopId &&
+                                  IsSameEpisodeTime(request.PickupTimeSeconds, leg.ArrivalTimeSeconds))
+                .Select(request => request.PassengerId)
+                .OrderBy(passengerId => passengerId)
+                .ToList();
+        }
+
+        private List<int> GetDroppedOffPassengerIds(DRTRouteLegRecord leg)
+        {
+            if (passengerManager == null || leg.ArrivedStopId <= 0)
+            {
+                return new List<int>();
+            }
+
+            return passengerManager.Requests
+                .Where(request => request != null &&
+                                  request.ActualDropoffStopId == leg.ArrivedStopId &&
+                                  IsSameEpisodeTime(request.DropoffTimeSeconds, leg.ArrivalTimeSeconds))
+                .Select(request => request.PassengerId)
+                .OrderBy(passengerId => passengerId)
+                .ToList();
+        }
+
+        private static bool IsSameEpisodeTime(float recordedTime, float currentEpisodeTime)
+        {
+            return recordedTime >= 0f && Mathf.Abs(recordedTime - currentEpisodeTime) <= 0.05f;
         }
 
         private static string SanitizeFileName(string fileName)
@@ -2141,6 +2505,54 @@ namespace DRT
             }
 
             return sanitized;
+        }
+
+        private static void AppendEpisodeRow(StringBuilder builder, string section, string key, string value)
+        {
+            builder
+                .Append(CsvEscape(section))
+                .Append(',')
+                .Append(CsvEscape(key))
+                .Append(',')
+                .Append(CsvEscape(value))
+                .AppendLine();
+        }
+
+        private static string FormatPassengerIdList(List<int> passengerIds)
+        {
+            return passengerIds == null || passengerIds.Count == 0
+                ? string.Empty
+                : string.Join("|", passengerIds);
+        }
+
+        private static string FormatCsvFloatList(List<float> values)
+        {
+            if (values == null || values.Count == 0)
+            {
+                return string.Empty;
+            }
+
+            return string.Join("|", values.Select(FormatCsvFloat));
+        }
+
+        private static float Median(List<float> values)
+        {
+            if (values == null || values.Count == 0)
+            {
+                return 0f;
+            }
+
+            var sortedValues = new List<float>(values);
+            sortedValues.Sort();
+            int middle = sortedValues.Count / 2;
+            return sortedValues.Count % 2 == 1
+                ? sortedValues[middle]
+                : (sortedValues[middle - 1] + sortedValues[middle]) * 0.5f;
+        }
+
+        private static string BuildStopPairKey(int fromStopId, int toStopId)
+        {
+            return $"{fromStopId}->{toStopId}";
         }
 
         private static string FormatCsvFloat(float value)

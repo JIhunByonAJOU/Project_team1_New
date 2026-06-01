@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import re
 import statistics
@@ -71,6 +72,8 @@ class EpisodeRecord:
     policy: str
     scenario_id: str
     timestamp: datetime | None
+    json_data: dict[str, object] | None = None
+    episode_csv_rows: dict[str, list[dict[str, str]]] | None = None
     metrics: dict[str, float] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
@@ -148,7 +151,7 @@ def display_policy(raw: str | None) -> str | None:
 
 
 def is_matrix_teleport(values: dict[str, str]) -> bool:
-    raw = values.get("travel_execution_mode") or values.get("mode") or values.get("execution_mode")
+    raw = values.get("travel_execution_mode") or values.get("travel_mode") or values.get("mode") or values.get("execution_mode")
     return normalize_token(raw) in {"matrixteleport", "matrix"}
 
 
@@ -185,11 +188,87 @@ def read_summary(path: Path) -> dict[str, str]:
     return values
 
 
+def scalar_to_summary_value(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    return str(value)
+
+
+def read_episode_json(path: Path) -> tuple[dict[str, str], dict[str, object]]:
+    with path.open("r", encoding="utf-8-sig") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        return {}, {}
+    summary = data.get("summary")
+    if not isinstance(summary, dict):
+        return {}, data
+    return {str(key): scalar_to_summary_value(value) for key, value in summary.items()}, data
+
+
+def read_episode_section_csv(path: Path) -> tuple[dict[str, str], dict[str, list[dict[str, str]]]]:
+    values: dict[str, str] = {}
+    sections: dict[str, list[dict[str, str]]] = {"route_legs": [], "passengers": []}
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.reader(handle))
+
+    index = 0
+    while index < len(rows):
+        row = rows[index]
+        if not row or not any(cell.strip() for cell in row):
+            index += 1
+            continue
+
+        header = [cell.strip() for cell in row]
+        if header[:3] == ["section", "key", "value"]:
+            index += 1
+            while index < len(rows):
+                current = rows[index]
+                if not current or not any(cell.strip() for cell in current):
+                    index += 1
+                    break
+                if len(current) >= 3 and current[0].strip() == "summary":
+                    values[current[1].strip()] = current[2].strip()
+                index += 1
+            continue
+
+        if header and header[0] == "section":
+            section_name = ""
+            if len(header) > 1 and header[1] == "leg_index":
+                section_name = "route_legs"
+            elif len(header) > 1 and header[1] == "passenger_id":
+                section_name = "passengers"
+
+            if section_name:
+                index += 1
+                while index < len(rows):
+                    current = rows[index]
+                    if not current or not any(cell.strip() for cell in current):
+                        index += 1
+                        break
+                    padded = current + [""] * max(0, len(header) - len(current))
+                    record = {header[col]: padded[col] for col in range(len(header))}
+                    sections[section_name].append(record)
+                    index += 1
+                continue
+
+        index += 1
+
+    return values, sections
+
+
 def read_dict_rows(path: Path) -> list[dict[str, str]]:
     if not path.exists():
         return []
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         return list(csv.DictReader(handle))
+
+
+def dict_rows(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    return [row for row in value if isinstance(row, dict)]
 
 
 def first_numeric(row: dict[str, str], candidates: Iterable[str]) -> float | None:
@@ -236,13 +315,27 @@ def load_network_average_reward_minutes(path: str | Path | None) -> float | None
 
 
 def timestamp_from_name(path: Path) -> datetime | None:
-    match = re.search(r"(\d{8})_(\d{6})", path.name)
-    if not match:
-        return None
-    try:
-        return datetime.strptime("_".join(match.groups()), "%Y%m%d_%H%M%S")
-    except ValueError:
-        return None
+    candidates = [path.name, *reversed(path.parts)]
+    for candidate in candidates:
+        match = re.search(r"(\d{8})_(\d{6})", candidate)
+        if not match:
+            continue
+        try:
+            return datetime.strptime("_".join(match.groups()), "%Y%m%d_%H%M%S")
+        except ValueError:
+            continue
+
+    for candidate in candidates:
+        match = re.search(r"(\d{4})_(\d{6})", candidate)
+        if not match:
+            continue
+        try:
+            year = datetime.fromtimestamp(path.stat().st_mtime).year if path.exists() else datetime.now().year
+            return datetime.strptime(f"{year}{match.group(1)}_{match.group(2)}", "%Y%m%d_%H%M%S")
+        except (OSError, ValueError):
+            continue
+
+    return None
 
 
 def companion_path(summary_path: Path, suffix: str) -> Path:
@@ -336,8 +429,20 @@ def enrich_metrics(record: EpisodeRecord, network_average_reward_minutes: float 
     if reward_keys and "reward" not in record.metrics:
         record.metrics["reward"] = record.metrics[reward_keys[0]]
 
-    passengers_path = companion_path(record.path, "_passengers.csv")
-    passenger_rows = read_dict_rows(passengers_path)
+    passenger_rows: list[dict[str, object]]
+    route_rows: list[dict[str, object]]
+    if record.episode_csv_rows is not None:
+        passenger_rows = record.episode_csv_rows.get("passengers", [])
+        route_rows = record.episode_csv_rows.get("route_legs", [])
+    elif record.json_data is not None:
+        passenger_rows = dict_rows(record.json_data.get("passengers", []))
+        route_rows = dict_rows(record.json_data.get("route_legs", []))
+    else:
+        passengers_path = companion_path(record.path, "_passengers.csv")
+        passenger_rows = read_dict_rows(passengers_path)
+        route_path = companion_path(record.path, "_route_legs.csv")
+        route_rows = read_dict_rows(route_path)
+
     if passenger_rows:
         waits: list[float] = []
         rides: list[float] = []
@@ -363,11 +468,10 @@ def enrich_metrics(record: EpisodeRecord, network_average_reward_minutes: float 
         if rides:
             record.metrics.setdefault("average_ride_seconds", statistics.fmean(rides))
         record.metrics["passenger_csv_rows"] = float(len(passenger_rows))
-    else:
+    elif record.json_data is None and record.episode_csv_rows is None:
+        passengers_path = companion_path(record.path, "_passengers.csv")
         record.notes.append(f"Missing passenger companion CSV: {passengers_path.name}")
 
-    route_path = companion_path(record.path, "_route_legs.csv")
-    route_rows = read_dict_rows(route_path)
     if route_rows:
         distances: list[float] = []
         durations: list[float] = []
@@ -389,7 +493,8 @@ def enrich_metrics(record: EpisodeRecord, network_average_reward_minutes: float 
             record.metrics.setdefault("episode_distance_meters", sum(distances))
         if durations:
             record.metrics.setdefault("episode_time_seconds", sum(durations))
-    else:
+    elif record.json_data is None and record.episode_csv_rows is None:
+        route_path = companion_path(record.path, "_route_legs.csv")
         record.notes.append(f"Missing route companion CSV: {route_path.name}")
 
     if "reward" not in record.metrics:
@@ -407,6 +512,50 @@ def discover_records(export_dirs: list[str], network_average_reward_minutes: flo
         root = Path(export_dir)
         if not root.exists():
             continue
+        for episode_path in sorted(root.rglob("*_episode.csv")):
+            try:
+                values, section_rows = read_episode_section_csv(episode_path)
+            except OSError:
+                continue
+            if not is_matrix_teleport(values):
+                continue
+            policy = display_policy(values.get("next_stop_policy") or values.get("policy"))
+            if policy not in TARGET_POLICIES:
+                continue
+            scenario_id = values.get("scenario_id") or values.get("scenario") or "unknown"
+            record = EpisodeRecord(
+                path=episode_path,
+                values=values,
+                policy=policy,
+                scenario_id=str(scenario_id),
+                timestamp=timestamp_from_name(episode_path),
+                episode_csv_rows=section_rows,
+            )
+            enrich_metrics(record, network_average_reward_minutes)
+            records.append(record)
+
+        for episode_path in sorted(root.rglob("*_episode.json")):
+            try:
+                values, json_data = read_episode_json(episode_path)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not is_matrix_teleport(values):
+                continue
+            policy = display_policy(values.get("next_stop_policy") or values.get("policy"))
+            if policy not in TARGET_POLICIES:
+                continue
+            scenario_id = values.get("scenario_id") or values.get("scenario") or "unknown"
+            record = EpisodeRecord(
+                path=episode_path,
+                values=values,
+                policy=policy,
+                scenario_id=str(scenario_id),
+                timestamp=timestamp_from_name(episode_path),
+                json_data=json_data,
+            )
+            enrich_metrics(record, network_average_reward_minutes)
+            records.append(record)
+
         for summary_path in sorted(root.rglob("*_summary.csv")):
             values = read_summary(summary_path)
             if not is_matrix_teleport(values):
@@ -805,8 +954,8 @@ def build_pdf(
     if not records:
         story.append(
             Paragraph(
-                "No Matrix Teleport summary CSVs were found. This PDF is a readiness report; place the 10 Vanilla "
-                "Sequential and 10 ONNX Inference *_summary.csv files in the export folder, then rerun the script.",
+                "No Matrix Teleport episode exports were found. This PDF is a readiness report; place the 10 Vanilla "
+                "Sequential and 10 ONNX Inference *_episode.csv, *_episode.json, or *_summary.csv files in the export folder, then rerun the script.",
                 styles["Warn"],
             )
         )

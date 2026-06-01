@@ -6,21 +6,31 @@
 
 ## 강화학습 캡스톤 프로젝트
 
-이 프로젝트는 Unity 기반 DRT(Demand Responsive Transit) 버스 동적 경로 생성을 위한 강화학습 캡스톤 프로젝트입니다.
+**목표: 수요 기반 다음 정류장 선택으로 DRT 버스 운영 효율을 개선한다.**
 
-목표는 고정 순환 방식인 `Vanilla Sequential`과 비교했을 때, 학습된 PPO/ONNX 정책이 현재 승객 수요를 보고 더 효율적인 다음 정류장을 선택하도록 만드는 것입니다. 비교 기준은 전체 승객 처리율을 유지하면서 평균 대기시간, 총 운행시간, 이동거리, route leg 수, reward를 얼마나 개선하는지입니다.
+- 문제: 고정 순환 노선은 실제 승객 수요와 무관하게 정류장을 방문한다.
+- 해결: PPO agent가 현재 승객 상태를 보고 다음 정류장을 선택한다.
+- 비교: `ONNX Inference` 정책 vs `Vanilla Sequential` baseline.
+- 평가: service rate는 유지하고, wait time / episode time / distance / route legs / reward를 비교한다.
 
 ## MDP 관점 설계
 
 | 구분 | 설계 |
 |---|---|
-| Agent | `DRTNextStopSelector`가 PPO agent로 동작하며, 버스가 다음 목적지를 정해야 할 때마다 decision을 수행합니다. |
-| Environment | Unity/Gley 교통 환경 위의 DRT 버스 운행 시뮬레이션입니다. 승객 요청, 정류장, 차량 이동, episode 종료 조건을 포함합니다. |
-| State | 현재 정류장, episode 진행 시간, 대기 승객 비율, 탑승 승객 비율, 남은 좌석 비율, 현재 서비스율을 관측합니다. |
-| Stop Features | 후보 정류장별 유효 여부, 현재 정류장 여부, 이동 시간/거리 feature, 대기 승객 수, 하차 대상 승객 수, 예정 수요, 최대 대기시간, 최대 탑승시간을 관측합니다. |
-| Action | discrete action으로 다음 정류장 하나를 선택합니다. 존재하지 않는 정류장과 현재 정류장은 action mask로 제외합니다. |
-| Policy | `MLAgentsTraining`으로 학습하고, 학습된 모델은 `ONNXInference`로 실행합니다. 비교 기준 정책은 고정 순환 방식인 `VanillaSequential`입니다. |
-| Episode End | 모든 승객 요청 완료, episode 시간 종료, 차량 fault, 유효한 다음 정류장 없음 등의 조건에서 episode가 종료됩니다. |
+| Agent | `DRTNextStopSelector` |
+| Algorithm | PPO, Unity ML-Agents |
+| Environment | Unity + Gley Traffic System |
+| State: Bus | current stop, episode time, service rate |
+| State: Capacity | waiting ratio, onboard ratio, remaining capacity ratio |
+| State: Stop | valid flag, current-stop flag, travel feature |
+| State: Demand | waiting passengers, dropoff targets, scheduled demand |
+| State: Time | max wait time, max ride time |
+| Action | next stop index |
+| Action Mask | invalid stop, current stop |
+| Training Policy | `MLAgentsTraining` |
+| Inference Policy | `ONNXInference` |
+| Baseline | `VanillaSequential` |
+| Done | all requests completed, time limit, vehicle fault, invalid route |
 
 ## Reward / Penalty
 
@@ -30,20 +40,18 @@ R_stop = boarding_reward + dropoff_reward - unboarded_passenger_penalty
 
 | 항목 | 의미 |
 |---|---|
-| Boarding Reward | 도착 정류장에서 승객을 태우면 보상을 줍니다. 빠르게 태울수록 정책이 대기시간을 줄이는 방향으로 학습됩니다. |
-| Dropoff Reward | 탑승 승객을 목적지 정류장에 내려주면 보상을 줍니다. 단순 pickup만이 아니라 실제 서비스 완료를 유도합니다. |
-| Waiting Penalty | 이미 요청 시간이 지난 승객이 계속 탑승하지 못하면 대기시간에 비례해 패널티를 줍니다. |
-| Failure Penalty | 차량 fault, route 실패, 유효하지 않은 진행 상황은 episode 품질을 낮추는 외부 패널티로 처리합니다. |
+| Boarding Reward | waiting passenger pickup |
+| Dropoff Reward | onboard passenger completed |
+| Waiting Penalty | unserved request waiting time |
+| Failure Penalty | vehicle fault, route failure |
 
-보상 설계의 핵심은 단순히 가까운 정류장만 고르는 것이 아니라, 기다리는 승객과 탑승 중인 승객의 목적지를 함께 고려하게 만드는 것입니다.
+핵심: 가까운 정류장이 아니라 **대기 승객 + 하차 수요 + 서비스 완료**를 함께 고려하도록 학습한다.
 
 ## Passenger Request Panel
 
 ![Passenger request panel](docs/assets/passenger-request.png)
 
-이 패널은 시뮬레이션에 들어온 승객 요청 상태를 보여줍니다.
-
-주요 정보:
+승객 요청 상태 확인용 패널.
 
 - 승객 ID
 - 출발 정류장과 도착 정류장
@@ -52,16 +60,13 @@ R_stop = boarding_reward + dropoff_reward - unboarded_passenger_penalty
 - pickup/dropoff 시간
 - 대기시간과 탑승시간
 
-승객 상태는 `Scheduled`, `Waiting`, `OnBoard`, `Completed`로 관리됩니다.
-이 정보가 에이전트 관측값과 보상 계산의 핵심 입력이 됩니다.
+상태 흐름: `Scheduled` -> `Waiting` -> `OnBoard` -> `Completed`
 
 ## DRT Bus Status Panel
 
 ![DRT bus status panel](docs/assets/drt-bus-status.png)
 
-이 패널은 버스와 정책의 현재 실행 상태를 보여줍니다.
-
-주요 정보:
+버스 운행과 정책 실행 상태 확인용 패널.
 
 - 실행 모드: `MatrixTeleport` 또는 `PhysicalDrive`
 - 정책 모드: `MLAgentsTraining`, `ONNXInference`, `VanillaSequential`
@@ -71,11 +76,11 @@ R_stop = boarding_reward + dropoff_reward - unboarded_passenger_penalty
 - 탑승 중, 대기 중, 완료된 승객 수
 - 정류장별 demand 상태
 
-학습된 정책이 단순 순환이 아니라 실제 수요가 있는 정류장을 우선 선택하는지 확인할 때 사용합니다.
+확인 포인트: 학습 정책이 단순 순환이 아니라 demand가 높은 정류장을 우선 선택하는가.
 
 ## 실험 결과 요약
 
-현재 scenario 30 실험은 12개 정류장, 30명 승객, `MatrixTeleport` 실행, `DRTNextStopPPO-70999.onnx` 추론 모델을 기준으로 합니다.
+기준: scenario 30, 12 stops, 30 passengers, `MatrixTeleport`, `DRTNextStopPPO-70999.onnx`.
 
 | Metric           | Vanilla Sequential | ONNX Inference |      Change |
 | ---------------- | -----------------: | -------------: | ----------: |
@@ -88,4 +93,4 @@ R_stop = boarding_reward + dropoff_reward - unboarded_passenger_penalty
 | Route legs       |              62.00 |          51.50 |      -16.9% |
 | Reward           |            -476.00 |         172.83 | ONNX better |
 
-두 정책 모두 전체 승객 요청을 완료하지만, ONNX 정책은 평균 대기시간과 총 운행시간, route leg 수, 총 이동거리를 줄입니다.
+결론: service rate는 유지하면서 ONNX 정책이 대기시간, 운행시간, route leg, 이동거리를 줄였다.

@@ -2,10 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
-using Gley.TrafficSystem;
-using UnityEngine;
-
-using VehicleTypes = Gley.TrafficSystem.User.VehicleTypes;
 
 namespace DRT
 {
@@ -41,6 +37,7 @@ namespace DRT
             for (int i = 0; i < rawLines.Length; i++)
             {
                 string line = rawLines[i].Trim();
+                line = line.TrimStart('\uFEFF');
                 if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal))
                 {
                     continue;
@@ -88,72 +85,6 @@ namespace DRT
             }
 
             Apply(sortedStops, parsed);
-            return true;
-        }
-
-        public bool GenerateFromGleyPaths(
-            IReadOnlyList<DRTStop> stops,
-            Func<DRTStop, Vector3> getServicePoint,
-            VehicleTypes vehicleType,
-            float nominalSpeedMetersPerSecond,
-            out string csvText,
-            out string error)
-        {
-            Clear();
-            csvText = null;
-            error = null;
-
-            if (!API.IsInitialized())
-            {
-                error = "Gley Traffic API is not initialized.";
-                return false;
-            }
-
-            if (getServicePoint == null)
-            {
-                error = "Service point resolver is missing.";
-                return false;
-            }
-
-            List<DRTStop> sortedStops = GetSortedStops(stops);
-            if (sortedStops.Count == 0)
-            {
-                error = "No stops are available.";
-                return false;
-            }
-
-            float speed = Mathf.Max(0.1f, nominalSpeedMetersPerSecond);
-            var generated = new float[sortedStops.Count, sortedStops.Count];
-
-            for (int row = 0; row < sortedStops.Count; row++)
-            {
-                DRTStop origin = sortedStops[row];
-                Vector3 originPoint = getServicePoint(origin);
-
-                for (int column = 0; column < sortedStops.Count; column++)
-                {
-                    if (row == column)
-                    {
-                        generated[row, column] = 0f;
-                        continue;
-                    }
-
-                    DRTStop destination = sortedStops[column];
-                    Vector3 destinationPoint = getServicePoint(destination);
-                    List<int> path = API.GetPath(originPoint, destinationPoint, vehicleType);
-                    if (path == null)
-                    {
-                        error = $"Gley path not found from Stop {origin.StopId} to Stop {destination.StopId}.";
-                        return false;
-                    }
-
-                    float distanceMeters = CalculatePathDistanceMeters(originPoint, destinationPoint, path);
-                    generated[row, column] = Mathf.Max(0.01f, distanceMeters / speed);
-                }
-            }
-
-            Apply(sortedStops, generated);
-            csvText = ToCsv();
             return true;
         }
 
@@ -262,7 +193,7 @@ namespace DRT
             }
         }
 
-        private void Clear()
+        public void Clear()
         {
             stopIdToIndex.Clear();
             travelTimeSeconds = new float[0, 0];
@@ -287,37 +218,6 @@ namespace DRT
 
             sortedStops.Sort((a, b) => a.StopId.CompareTo(b.StopId));
             return sortedStops;
-        }
-
-        private static float CalculatePathDistanceMeters(Vector3 origin, Vector3 destination, List<int> path)
-        {
-            Vector3 previousPoint = origin;
-            float distance = 0f;
-
-            if (path != null)
-            {
-                for (int i = 0; i < path.Count; i++)
-                {
-                    TrafficWaypoint waypoint = API.GetWaypointFromIndex(path[i]);
-                    if (waypoint == null)
-                    {
-                        continue;
-                    }
-
-                    distance += GetPlanarDistance(previousPoint, waypoint.Position);
-                    previousPoint = waypoint.Position;
-                }
-            }
-
-            distance += GetPlanarDistance(previousPoint, destination);
-            return distance;
-        }
-
-        private static float GetPlanarDistance(Vector3 a, Vector3 b)
-        {
-            a.y = 0f;
-            b.y = 0f;
-            return Vector3.Distance(a, b);
         }
     }
 }

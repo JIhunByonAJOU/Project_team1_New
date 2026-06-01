@@ -1,7 +1,11 @@
 #if UNITY_EDITOR
 using System;
+using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Reflection;
+using System.Text;
 using Unity.Barracuda;
 using UnityEditor;
 using UnityEditor.SceneManagement;
@@ -53,6 +57,7 @@ namespace DRT.Editor
             }
 
             FinishActiveEpisode("Smoke interrupted by script reload.");
+            WriteRunSummaryIfNeeded();
             DeleteSmokeFlag();
             SessionState.SetBool(RunningKey, false);
             Debug.Log("[DRT_SMOKE] Stopping interrupted Play Mode smoke test.");
@@ -147,6 +152,14 @@ namespace DRT.Editor
                 SessionState.SetBool(WaitingKey, false);
                 SessionState.SetBool(RunningKey, false);
                 Debug.Log("[DRT_SMOKE] Smoke flag removed.");
+            }
+
+            if (state == PlayModeStateChange.EnteredEditMode && SessionState.GetBool(RunningKey, false))
+            {
+                EditorApplication.update -= UpdateSmoke;
+                WriteRunSummaryIfNeeded();
+                SessionState.SetBool(RunningKey, false);
+                Debug.Log("[DRT_SMOKE] Smoke run stopped from Play Mode exit.");
             }
 
             if (state == PlayModeStateChange.EnteredEditMode &&
@@ -419,6 +432,7 @@ namespace DRT.Editor
                 FinishActiveEpisode(reason);
             }
 
+            WriteRunSummaryIfNeeded();
             Debug.Log($"[DRT_SMOKE] Stopping Play Mode smoke test. reason={reason}");
             EditorApplication.ExitPlaymode();
         }
@@ -455,21 +469,21 @@ namespace DRT.Editor
 
             string policyToken = GetPolicyExportToken(SessionState.GetString(PolicyKey, string.Empty));
             string travelToken = GetTravelModeExportToken(SessionState.GetString(TravelModeKey, string.Empty));
-            string pattern = $"drt_{travelToken}_{policyToken}_*_summary.csv";
+            string pattern = $"drt_{travelToken}_{policyToken}_*_episode.csv";
             DateTime startTime = GetRunStartWallTime().AddSeconds(-1);
             int count = 0;
 
-            foreach (string summaryPath in Directory.GetFiles(exportDirectory, pattern, SearchOption.TopDirectoryOnly))
+            foreach (string episodePath in Directory.GetFiles(exportDirectory, pattern, SearchOption.AllDirectories))
             {
                 try
                 {
-                    if (File.GetLastWriteTime(summaryPath) < startTime)
+                    if (File.GetLastWriteTime(episodePath) < startTime)
                     {
                         continue;
                     }
 
-                    string text = File.ReadAllText(summaryPath);
-                    if (text.Contains("completed_all_requests,1"))
+                    string text = File.ReadAllText(episodePath);
+                    if (text.Contains("summary,completed_all_requests,1"))
                     {
                         count++;
                     }
@@ -494,6 +508,381 @@ namespace DRT.Editor
             return DateTime.Now;
         }
 
+        private static void WriteRunSummaryIfNeeded()
+        {
+            string projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
+            string exportDirectory = Path.Combine(projectRoot, "DRT_Episode_Exports");
+            if (!Directory.Exists(exportDirectory))
+            {
+                return;
+            }
+
+            string policyToken = GetPolicyExportToken(SessionState.GetString(PolicyKey, string.Empty));
+            string travelToken = GetTravelModeExportToken(SessionState.GetString(TravelModeKey, string.Empty));
+            string pattern = $"drt_{travelToken}_{policyToken}_*_episode.csv";
+            DateTime startTime = GetRunStartWallTime().AddSeconds(-1);
+            var records = new List<EpisodeCsvRecord>();
+
+            foreach (string episodePath in Directory.GetFiles(exportDirectory, pattern, SearchOption.AllDirectories))
+            {
+                if (File.GetLastWriteTime(episodePath) < startTime)
+                {
+                    continue;
+                }
+
+                if (TryReadEpisodeCsv(episodePath, out EpisodeCsvRecord record))
+                {
+                    records.Add(record);
+                }
+            }
+
+            if (records.Count == 0)
+            {
+                return;
+            }
+
+            string runDirectory = records
+                .OrderByDescending(record => File.GetLastWriteTime(record.Path))
+                .Select(record => Path.GetDirectoryName(record.Path))
+                .FirstOrDefault(directory => !string.IsNullOrWhiteSpace(directory));
+            if (string.IsNullOrWhiteSpace(runDirectory))
+            {
+                return;
+            }
+
+            var completedRecords = records
+                .Where(record => record.IsCompletedAllRequests)
+                .OrderBy(record => record.EpisodeIndex)
+                .ToList();
+            string summaryPath = Path.Combine(runDirectory, $"drt_{travelToken}_{policyToken}_run_summary.csv");
+            File.WriteAllText(summaryPath, BuildRunSummaryCsv(records, completedRecords), Encoding.UTF8);
+            Debug.Log(
+                $"[DRT_SMOKE] Run summary exported. path={summaryPath}, " +
+                $"included={completedRecords.Count}, excluded={records.Count - completedRecords.Count}");
+        }
+
+        private static bool TryReadEpisodeCsv(string path, out EpisodeCsvRecord record)
+        {
+            record = new EpisodeCsvRecord { Path = path };
+
+            try
+            {
+                string[] lines = File.ReadAllLines(path, Encoding.UTF8);
+                string[] header = Array.Empty<string>();
+
+                foreach (string line in lines)
+                {
+                    if (string.IsNullOrWhiteSpace(line))
+                    {
+                        continue;
+                    }
+
+                    List<string> cells = ParseCsvLine(line);
+                    if (cells.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    if (cells[0] == "section")
+                    {
+                        header = cells.ToArray();
+                        continue;
+                    }
+
+                    if (header.Length >= 3 && header[0] == "section" && header[1] == "key" && cells.Count >= 3)
+                    {
+                        if (cells[0] == "summary")
+                        {
+                            record.Summary[cells[1]] = cells[2];
+                        }
+
+                        continue;
+                    }
+
+                    if (header.Length > 1 && header[0] == "section" && cells[0] == "route_leg")
+                    {
+                        var row = new Dictionary<string, string>();
+                        for (int i = 0; i < header.Length; i++)
+                        {
+                            row[header[i]] = i < cells.Count ? cells[i] : string.Empty;
+                        }
+
+                        record.RouteLegs.Add(row);
+                    }
+                }
+
+                record.EpisodeIndex = ReadInt(record.Summary, "episode_index", -1);
+                return record.Summary.Count > 0;
+            }
+            catch (IOException)
+            {
+                return false;
+            }
+        }
+
+        private static string BuildRunSummaryCsv(List<EpisodeCsvRecord> allRecords, List<EpisodeCsvRecord> completedRecords)
+        {
+            var builder = new StringBuilder();
+            builder.AppendLine("section,key,value");
+            AppendSummaryRow(builder, "metadata", "generated_at", DateTime.Now.ToString("o", CultureInfo.InvariantCulture));
+            AppendSummaryRow(builder, "metadata", "source_episode_count", allRecords.Count.ToString(CultureInfo.InvariantCulture));
+            AppendSummaryRow(builder, "metadata", "included_completed_episode_count", completedRecords.Count.ToString(CultureInfo.InvariantCulture));
+            AppendSummaryRow(builder, "metadata", "excluded_incomplete_episode_count", (allRecords.Count - completedRecords.Count).ToString(CultureInfo.InvariantCulture));
+
+            if (completedRecords.Count == 0)
+            {
+                AppendSummaryRow(builder, "averages", "status", "average unavailable");
+                AppendSummaryRow(builder, "averages", "reason", "평균 낼 수 없음");
+                return builder.ToString();
+            }
+
+            AppendAverage(builder, completedRecords, "episode_time_seconds");
+            AppendAverage(builder, completedRecords, "episode_distance_meters");
+            AppendAverage(builder, completedRecords, "service_rate");
+            AppendAverage(builder, completedRecords, "completed_passengers");
+            AppendAverage(builder, completedRecords, "total_passengers");
+            AppendAverage(builder, completedRecords, "average_wait_seconds");
+            AppendAverage(builder, completedRecords, "average_ride_seconds");
+            AppendSummaryRow(builder, "averages", "mean_route_leg_count", FormatFloat((float)completedRecords.Average(record => record.RouteLegs.Count)));
+
+            AppendRouteUsageSummary(builder, completedRecords);
+            builder.AppendLine();
+            builder.AppendLine("section,episode_index,episode_file,episode_time_seconds,episode_distance_meters,service_rate,completed_passengers,average_wait_seconds,average_ride_seconds,route_leg_count,route_sequence");
+
+            foreach (EpisodeCsvRecord record in completedRecords)
+            {
+                builder
+                    .Append("episode").Append(',')
+                    .Append(record.EpisodeIndex.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(CsvEscape(Path.GetFileName(record.Path))).Append(',')
+                    .Append(CsvEscape(GetSummaryValue(record, "episode_time_seconds"))).Append(',')
+                    .Append(CsvEscape(GetSummaryValue(record, "episode_distance_meters"))).Append(',')
+                    .Append(CsvEscape(GetSummaryValue(record, "service_rate"))).Append(',')
+                    .Append(CsvEscape(GetSummaryValue(record, "completed_passengers"))).Append(',')
+                    .Append(CsvEscape(GetSummaryValue(record, "average_wait_seconds"))).Append(',')
+                    .Append(CsvEscape(GetSummaryValue(record, "average_ride_seconds"))).Append(',')
+                    .Append(record.RouteLegs.Count.ToString(CultureInfo.InvariantCulture)).Append(',')
+                    .Append(CsvEscape(BuildRouteSequence(record)))
+                    .AppendLine();
+            }
+
+            return builder.ToString();
+        }
+
+        private static void AppendRouteUsageSummary(StringBuilder builder, List<EpisodeCsvRecord> completedRecords)
+        {
+            var sequenceCounts = completedRecords
+                .Select(BuildRouteSequence)
+                .Where(sequence => !string.IsNullOrWhiteSpace(sequence))
+                .GroupBy(sequence => sequence)
+                .Select(group => new RouteUsage(group.Key, group.Count()))
+                .OrderByDescending(item => item.Count)
+                .ThenBy(item => item.Sequence)
+                .ToList();
+
+            AppendTopUsage(builder, "route_summary", "most_used_route_sequence", "route_sequence_count", "route_sequence_share", sequenceCounts, completedRecords.Count);
+
+            var pairCounts = completedRecords
+                .SelectMany(record => record.RouteLegs)
+                .Select(BuildRoutePair)
+                .Where(pair => !string.IsNullOrWhiteSpace(pair))
+                .GroupBy(pair => pair)
+                .Select(group => new RouteUsage(group.Key, group.Count()))
+                .OrderByDescending(item => item.Count)
+                .ThenBy(item => item.Sequence)
+                .ToList();
+            int totalPairCount = pairCounts.Sum(item => item.Count);
+            AppendTopUsage(builder, "route_summary", "most_used_route_leg_pair", "route_leg_pair_count", "route_leg_pair_share", pairCounts, totalPairCount);
+        }
+
+        private static void AppendTopUsage(
+            StringBuilder builder,
+            string section,
+            string valueKey,
+            string countKey,
+            string shareKey,
+            List<RouteUsage> items,
+            int denominator)
+        {
+            if (items.Count == 0 || denominator <= 0)
+            {
+                AppendSummaryRow(builder, section, valueKey, "평균 낼 수 없음");
+                return;
+            }
+
+            int topCount = items[0].Count;
+            int tiedCount = items.Count(item => item.Count == topCount);
+            if (tiedCount > 1)
+            {
+                AppendSummaryRow(builder, section, valueKey, "평균 낼 수 없음");
+                AppendSummaryRow(builder, section, countKey, topCount.ToString(CultureInfo.InvariantCulture));
+                AppendSummaryRow(builder, section, "tie_count", tiedCount.ToString(CultureInfo.InvariantCulture));
+                return;
+            }
+
+            AppendSummaryRow(builder, section, valueKey, items[0].Sequence);
+            AppendSummaryRow(builder, section, countKey, topCount.ToString(CultureInfo.InvariantCulture));
+            AppendSummaryRow(builder, section, shareKey, FormatFloat((float)topCount / denominator));
+        }
+
+        private static string BuildRouteSequence(EpisodeCsvRecord record)
+        {
+            return string.Join("|", record.RouteLegs.Select(BuildRoutePair).Where(pair => !string.IsNullOrWhiteSpace(pair)));
+        }
+
+        private static string BuildRoutePair(Dictionary<string, string> leg)
+        {
+            string from = GetValue(leg, "from_stop_id");
+            string to = GetValue(leg, "to_stop_id");
+            return string.IsNullOrWhiteSpace(from) || string.IsNullOrWhiteSpace(to) ? string.Empty : $"{from}->{to}";
+        }
+
+        private static void AppendAverage(StringBuilder builder, List<EpisodeCsvRecord> records, string key)
+        {
+            var values = records
+                .Select(record => ReadFloat(record.Summary, key))
+                .Where(value => value.HasValue)
+                .Select(value => value.Value)
+                .ToList();
+
+            if (values.Count != records.Count || values.Count == 0)
+            {
+                AppendSummaryRow(builder, "averages", $"mean_{key}", "평균 낼 수 없음");
+                return;
+            }
+
+            AppendSummaryRow(builder, "averages", $"mean_{key}", FormatFloat(values.Average()));
+        }
+
+        private static void AppendSummaryRow(StringBuilder builder, string section, string key, string value)
+        {
+            builder
+                .Append(CsvEscape(section))
+                .Append(',')
+                .Append(CsvEscape(key))
+                .Append(',')
+                .Append(CsvEscape(value))
+                .AppendLine();
+        }
+
+        private static List<string> ParseCsvLine(string line)
+        {
+            var result = new List<string>();
+            var cell = new StringBuilder();
+            bool inQuotes = false;
+
+            for (int i = 0; i < line.Length; i++)
+            {
+                char current = line[i];
+                if (inQuotes)
+                {
+                    if (current == '"' && i + 1 < line.Length && line[i + 1] == '"')
+                    {
+                        cell.Append('"');
+                        i++;
+                    }
+                    else if (current == '"')
+                    {
+                        inQuotes = false;
+                    }
+                    else
+                    {
+                        cell.Append(current);
+                    }
+                }
+                else if (current == ',')
+                {
+                    result.Add(cell.ToString());
+                    cell.Length = 0;
+                }
+                else if (current == '"')
+                {
+                    inQuotes = true;
+                }
+                else
+                {
+                    cell.Append(current);
+                }
+            }
+
+            result.Add(cell.ToString());
+            return result;
+        }
+
+        private static int ReadInt(Dictionary<string, string> values, string key, int fallback)
+        {
+            return int.TryParse(GetValue(values, key), NumberStyles.Integer, CultureInfo.InvariantCulture, out int value)
+                ? value
+                : fallback;
+        }
+
+        private static float? ReadFloat(Dictionary<string, string> values, string key)
+        {
+            return float.TryParse(GetValue(values, key), NumberStyles.Float, CultureInfo.InvariantCulture, out float value)
+                ? value
+                : (float?)null;
+        }
+
+        private static string GetSummaryValue(EpisodeCsvRecord record, string key)
+        {
+            return GetValue(record.Summary, key);
+        }
+
+        private static string GetValue(Dictionary<string, string> values, string key)
+        {
+            return values.TryGetValue(key, out string value) ? value : string.Empty;
+        }
+
+        private static string FormatFloat(float value)
+        {
+            return value.ToString("0.###", CultureInfo.InvariantCulture);
+        }
+
+        private static string CsvEscape(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return string.Empty;
+            }
+
+            bool mustQuote = value.Contains(",") || value.Contains("\"") || value.Contains("\r") || value.Contains("\n");
+            if (!mustQuote)
+            {
+                return value;
+            }
+
+            return $"\"{value.Replace("\"", "\"\"")}\"";
+        }
+
+        private sealed class EpisodeCsvRecord
+        {
+            public string Path;
+            public int EpisodeIndex;
+            public readonly Dictionary<string, string> Summary = new Dictionary<string, string>();
+            public readonly List<Dictionary<string, string>> RouteLegs = new List<Dictionary<string, string>>();
+
+            public bool IsCompletedAllRequests
+            {
+                get
+                {
+                    string value = GetValue(Summary, "completed_all_requests").Trim();
+                    return value == "1" || value.Equals("true", StringComparison.OrdinalIgnoreCase);
+                }
+            }
+        }
+
+        private sealed class RouteUsage
+        {
+            public readonly string Sequence;
+            public readonly int Count;
+
+            public RouteUsage(string sequence, int count)
+            {
+                Sequence = sequence;
+                Count = count;
+            }
+        }
+
         private static string GetPolicyExportToken(string policyText)
         {
             if (Enum.TryParse(policyText, true, out DRTNextStopPolicy policy))
@@ -501,13 +890,15 @@ namespace DRT.Editor
                 switch (policy)
                 {
                     case DRTNextStopPolicy.ONNXInference:
-                        return "onnx_inference";
+                        return "inference";
                     case DRTNextStopPolicy.VanillaSequential:
-                        return "vanilla_sequential";
+                        return "vanilla";
+                    case DRTNextStopPolicy.AllStationRunner:
+                        return "all_station";
                 }
             }
 
-            return "ml_agents_training";
+            return "train";
         }
 
         private static string GetTravelModeExportToken(string travelModeText)
@@ -515,10 +906,10 @@ namespace DRT.Editor
             if (Enum.TryParse(travelModeText, true, out DRTTravelExecutionMode travelMode) &&
                 travelMode == DRTTravelExecutionMode.PhysicalDrive)
             {
-                return "physical_drive";
+                return "physical";
             }
 
-            return "matrix_teleport";
+            return "matrix";
         }
 
         private static void FinishActiveEpisode(string reason)
