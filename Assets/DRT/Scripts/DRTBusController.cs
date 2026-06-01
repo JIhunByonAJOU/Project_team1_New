@@ -1268,10 +1268,12 @@ namespace DRT
                 activeRouteLeg.CompletedPassengerCount = result.CompletedCount;
             }
 
-            routeLegRecords.Add(activeRouteLeg);
-            string traceEvent = activeRouteLeg.Completed ? "stop_arrival" : "leg_incomplete";
+            DRTRouteLegRecord completedLeg = activeRouteLeg;
+            routeLegRecords.Add(completedLeg);
+            string traceEvent = completedLeg.Completed ? "stop_arrival" : "leg_incomplete";
             activeRouteLeg = null;
             RecordVehicleTrace(traceEvent);
+            ExportPartialAllStationMatrixCsvIfNeeded(completedLeg);
         }
 
         private void ResetEpisodeExportState()
@@ -2099,6 +2101,22 @@ namespace DRT
             }
         }
 
+        private void ExportPartialAllStationMatrixCsvIfNeeded(DRTRouteLegRecord completedLeg)
+        {
+            if (completedLeg == null ||
+                !completedLeg.Completed ||
+                !UsesAllStationRunner ||
+                travelExecutionMode != DRTTravelExecutionMode.PhysicalDrive)
+            {
+                return;
+            }
+
+            ExportAllStationMatrixCsv(
+                true,
+                $"partial leg {completedLeg.FromStopId}->{completedLeg.ToStopId}",
+                false);
+        }
+
         private void ExportAllStationMatrixCsvIfNeeded(string finishReason)
         {
             if (allStationMatrixCsvExported || !UsesAllStationRunner)
@@ -2114,27 +2132,44 @@ namespace DRT
                 return;
             }
 
-            if (nextStopSelector == null || !nextStopSelector.IsAllStationRunComplete)
+            bool completedAllStationRun = nextStopSelector != null && nextStopSelector.IsAllStationRunComplete;
+            if (!completedAllStationRun)
             {
-                Debug.LogWarning($"[BUSCONTROLLER] All Station Runner matrix CSV skipped. run did not complete. reason={finishReason}");
-                return;
+                Debug.LogWarning($"[BUSCONTROLLER] All Station Runner ended before completion. Saving partial matrix CSV. reason={finishReason}");
             }
 
-            if (!TryBuildAllStationMatrixCsv(out string matrixCsv, out string samplesCsv, out string buildError))
+            ExportAllStationMatrixCsv(!completedAllStationRun, finishReason, true);
+        }
+
+        private void ExportAllStationMatrixCsv(bool allowPartial, string reason, bool finalExport)
+        {
+            if (!TryBuildAllStationMatrixCsv(
+                    allowPartial,
+                    out string matrixCsv,
+                    out string samplesCsv,
+                    out string buildError,
+                    out int measuredPairs,
+                    out int updatedPairs,
+                    out int preservedPairs,
+                    out int totalPairs))
             {
-                Debug.LogError($"[BUSCONTROLLER] All Station Runner matrix CSV skipped. {buildError}");
+                string message = $"[BUSCONTROLLER] All Station Runner matrix CSV skipped. {buildError}";
+                if (finalExport)
+                {
+                    Debug.LogError(message);
+                }
+                else
+                {
+                    Debug.LogWarning(message);
+                }
+
                 return;
             }
 
             try
             {
-                string resourcesPath = System.IO.Path.Combine(Application.dataPath, "DRT", "Resources");
-                Directory.CreateDirectory(resourcesPath);
-
-                string fileName = string.IsNullOrWhiteSpace(travelTimeMatrixResourceName)
-                    ? "drt_stop_travel_time_matrix"
-                    : travelTimeMatrixResourceName;
-                string matrixPath = System.IO.Path.Combine(resourcesPath, fileName + ".csv");
+                string matrixPath = GetTravelTimeMatrixCsvPath();
+                Directory.CreateDirectory(System.IO.Path.GetDirectoryName(matrixPath));
                 File.WriteAllText(matrixPath, matrixCsv, new UTF8Encoding(false));
 
                 string exportDirectory = GetEpisodeExportDirectory();
@@ -2148,7 +2183,8 @@ namespace DRT
 
                 InvalidateTravelTimeMatrix();
                 Debug.Log(
-                    $"[BUSCONTROLLER] All Station Runner matrix CSV exported. " +
+                    $"[BUSCONTROLLER] All Station Runner matrix CSV {(finalExport ? "exported" : "partial save")}. " +
+                    $"reason={reason}, measured={measuredPairs}/{totalPairs}, updated={updatedPairs}, preserved={preservedPairs}, " +
                     $"matrix={matrixPath}, samples={samplesPath}");
             }
             catch (Exception exception)
@@ -2157,11 +2193,23 @@ namespace DRT
             }
         }
 
-        private bool TryBuildAllStationMatrixCsv(out string matrixCsv, out string samplesCsv, out string error)
+        private bool TryBuildAllStationMatrixCsv(
+            bool allowPartial,
+            out string matrixCsv,
+            out string samplesCsv,
+            out string error,
+            out int measuredPairs,
+            out int updatedPairs,
+            out int preservedPairs,
+            out int totalPairs)
         {
             matrixCsv = string.Empty;
             samplesCsv = string.Empty;
             error = null;
+            measuredPairs = 0;
+            updatedPairs = 0;
+            preservedPairs = 0;
+            totalPairs = 0;
 
             var sortedStops = stops
                 .Where(stop => stop != null)
@@ -2170,6 +2218,14 @@ namespace DRT
             if (sortedStops.Count < 2)
             {
                 error = "At least two stops are required.";
+                return false;
+            }
+
+            totalPairs = sortedStops.Count * (sortedStops.Count - 1);
+            Dictionary<string, float> baselineByPair = null;
+            if (allowPartial && !TryLoadExistingMatrixValues(sortedStops, out baselineByPair, out string baselineError))
+            {
+                error = $"Cannot build partial matrix because the existing matrix could not be loaded. {baselineError}";
                 return false;
             }
 
@@ -2225,20 +2281,32 @@ namespace DRT
                     }
 
                     string key = BuildStopPairKey(fromStopId, toStopId);
-                    if (!samplesByPair.TryGetValue(key, out List<float> samples) || samples.Count == 0)
+                    bool hasSample = samplesByPair.TryGetValue(key, out List<float> samples) && samples.Count > 0;
+                    float matrixSeconds;
+                    if (hasSample)
+                    {
+                        matrixSeconds = Median(samples);
+                        measuredPairs++;
+                        updatedPairs++;
+                    }
+                    else if (allowPartial && baselineByPair != null && baselineByPair.TryGetValue(key, out float baselineSeconds))
+                    {
+                        matrixSeconds = baselineSeconds;
+                        preservedPairs++;
+                    }
+                    else
                     {
                         error = $"Missing completed route leg sample. from={fromStopId}, to={toStopId}";
                         return false;
                     }
 
-                    float matrixSeconds = Median(samples);
                     matrixBuilder.Append(FormatCsvFloat(matrixSeconds));
                     samplesBuilder
                         .Append(fromStopId.ToString(CultureInfo.InvariantCulture)).Append(',')
                         .Append(toStopId.ToString(CultureInfo.InvariantCulture)).Append(',')
-                        .Append(samples.Count.ToString(CultureInfo.InvariantCulture)).Append(',')
+                        .Append((hasSample ? samples.Count : 0).ToString(CultureInfo.InvariantCulture)).Append(',')
                         .Append(FormatCsvFloat(matrixSeconds)).Append(',')
-                        .Append(CsvEscape(FormatCsvFloatList(samples)))
+                        .Append(CsvEscape(hasSample ? FormatCsvFloatList(samples) : string.Empty))
                         .AppendLine();
                 }
             }
@@ -2248,9 +2316,104 @@ namespace DRT
             return true;
         }
 
+        private bool TryLoadExistingMatrixValues(
+            IReadOnlyList<DRTStop> sortedStops,
+            out Dictionary<string, float> valuesByPair,
+            out string error)
+        {
+            valuesByPair = new Dictionary<string, float>();
+            error = null;
+
+            if (sortedStops == null || sortedStops.Count < 2)
+            {
+                error = "At least two stops are required.";
+                return false;
+            }
+
+            string csvText = null;
+            string matrixPath = GetTravelTimeMatrixCsvPath();
+            if (File.Exists(matrixPath))
+            {
+                csvText = File.ReadAllText(matrixPath, Encoding.UTF8);
+            }
+            else
+            {
+                TextAsset csvAsset = Resources.Load<TextAsset>(travelTimeMatrixResourceName);
+                if (csvAsset != null)
+                {
+                    csvText = csvAsset.text;
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(csvText))
+            {
+                error = $"Existing matrix CSV not found. path={matrixPath}, resource={travelTimeMatrixResourceName}";
+                return false;
+            }
+
+            string[] rawLines = csvText.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            var lines = new List<string>();
+            for (int i = 0; i < rawLines.Length; i++)
+            {
+                string line = rawLines[i].Trim().TrimStart('\uFEFF');
+                if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                lines.Add(line);
+            }
+
+            if (lines.Count != sortedStops.Count)
+            {
+                error = $"Existing matrix must have {sortedStops.Count} rows, but has {lines.Count}.";
+                return false;
+            }
+
+            for (int row = 0; row < lines.Count; row++)
+            {
+                string[] columns = lines[row].Split(',');
+                if (columns.Length != sortedStops.Count)
+                {
+                    error = $"Existing matrix row {row + 1} must have {sortedStops.Count} columns, but has {columns.Length}.";
+                    return false;
+                }
+
+                int fromStopId = sortedStops[row].StopId;
+                for (int column = 0; column < columns.Length; column++)
+                {
+                    int toStopId = sortedStops[column].StopId;
+                    if (fromStopId == toStopId)
+                    {
+                        continue;
+                    }
+
+                    if (!float.TryParse(columns[column].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out float seconds) ||
+                        seconds <= 0f)
+                    {
+                        error = $"Existing matrix row {row + 1}, column {column + 1} must be a positive number.";
+                        return false;
+                    }
+
+                    valuesByPair[BuildStopPairKey(fromStopId, toStopId)] = seconds;
+                }
+            }
+
+            return true;
+        }
+
+        private string GetTravelTimeMatrixCsvPath()
+        {
+            string resourcesPath = System.IO.Path.Combine(Application.dataPath, "DRT", "Resources");
+            string fileName = string.IsNullOrWhiteSpace(travelTimeMatrixResourceName)
+                ? "drt_stop_travel_time_matrix"
+                : travelTimeMatrixResourceName;
+            return System.IO.Path.Combine(resourcesPath, fileName + ".csv");
+        }
+
         private bool ShouldCollectEpisodeExportData()
         {
-            return exportEpisodeCsvOnEpisodeEnd;
+            return exportEpisodeCsvOnEpisodeEnd || UsesAllStationRunner;
         }
 
         private static bool IsMlAgentsTrainingSession()

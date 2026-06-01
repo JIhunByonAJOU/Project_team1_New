@@ -255,7 +255,10 @@ namespace DRT
             RecordStat("DRT/EpisodeServiceRate", serviceRate, StatAggregationMethod.MostRecent);
             RecordStat("DRT/EpisodeCompletedPassengers", completedPassengerCount, StatAggregationMethod.MostRecent);
             CancelDecision();
-            EndEpisode();
+            if (!UsesAllStationRunner)
+            {
+                EndEpisode();
+            }
         }
 
         public override void CollectObservations(VectorSensor sensor)
