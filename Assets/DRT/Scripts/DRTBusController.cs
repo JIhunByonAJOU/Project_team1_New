@@ -22,85 +22,81 @@ namespace DRT
     [AddComponentMenu("DRT/DRT Bus Controller")]
     public class DRTBusController : MonoBehaviour
     {
-        [Header("Scene References")]
-        [SerializeField] private Transform busStopsRoot;
-        [SerializeField] private DRTPassengerManager passengerManager;
-        [SerializeField] private DRTDemandGenerator demandGenerator;
-        [SerializeField] private DRTNextStopSelector nextStopSelector;
-        [SerializeField] private Transform controlledPlayerVehicle;
+        [HideInInspector, SerializeField] private Transform busStopsRoot;
+        [HideInInspector, SerializeField] private DRTPassengerManager passengerManager;
+        [HideInInspector, SerializeField] private DRTDemandGenerator demandGenerator;
+        [HideInInspector, SerializeField] private DRTNextStopSelector nextStopSelector;
+        [HideInInspector, SerializeField] private Transform controlledPlayerVehicle;
 
         [Header("Vehicle")]
-        [SerializeField] private int vehicleIndex = 0;
-        [SerializeField] private int startStopId = 1;
-        [SerializeField] private VehicleTypes controlledVehicleType = VehicleTypes.Car;
-        [SerializeField] private float dwellSeconds = 5f;
-        [SerializeField] private float arrivalDistanceMeters = 5f;
-        [SerializeField] private float stopWaypointSnapDistanceMeters = 5f;
-        [SerializeField] private float arrivalWaitTimeoutSeconds = 12f;
-        [SerializeField] private float controlledVehicleSpeedMultiplier = 1.5f;
+        [SerializeField, InspectorName("Vehicle")] private int vehicleIndex = 0;
+        [SerializeField, InspectorName("Start Stop")] private int startStopId = 1;
+        [SerializeField, InspectorName("Vehicle Type")] private VehicleTypes controlledVehicleType = VehicleTypes.Car;
+        [SerializeField, InspectorName("Dwell (s)")] private float dwellSeconds = 5f;
+        [SerializeField, InspectorName("Arrival Dist")] private float arrivalDistanceMeters = 5f;
+        [HideInInspector, SerializeField] private float stopWaypointSnapDistanceMeters = 5f;
+        [HideInInspector, SerializeField] private float arrivalWaitTimeoutSeconds = 12f;
+        [SerializeField, InspectorName("Speed x")] private float controlledVehicleSpeedMultiplier = 1.5f;
         [Tooltip("Only used when Physical Drive uses the Gley vehicle driver. 1.0 keeps Gley speed unchanged; 1.12 means roughly +12%.")]
-        [SerializeField] private float gleyControlledVehicleSpeedMultiplier = 1.12f;
-        [SerializeField] private float playerWaypointReachDistanceMeters = 6f;
-        [SerializeField] private bool autoFollowControlledVehicle = true;
-        [SerializeField] private bool useGleyVehicleControlInPhysicalDrive = true;
+        [HideInInspector, SerializeField] private float gleyControlledVehicleSpeedMultiplier = 1.12f;
+        [HideInInspector, SerializeField] private float playerWaypointReachDistanceMeters = 6f;
+        [SerializeField, InspectorName("Follow Bus")] private bool autoFollowControlledVehicle = true;
+        [SerializeField, InspectorName("Gley Driver")] private bool useGleyVehicleControlInPhysicalDrive = true;
 
         [Header("Travel Execution")]
         [Tooltip("Controls how the selected next stop is reached. Matrix Teleport uses the travel-time matrix; Physical Drive uses the configured vehicle driver.")]
-        [InspectorName("Travel Execution Mode")]
+        [InspectorName("Mode")]
         [SerializeField] private DRTTravelExecutionMode travelExecutionMode = DRTTravelExecutionMode.MatrixTeleport;
-        [SerializeField] private string travelTimeMatrixResourceName = "drt_stop_travel_time_matrix";
-        [SerializeField] private float matrixNominalSpeedMetersPerSecond = 15f;
-        [SerializeField] private bool preferGeneratedMatrixFromGley = true;
-        [SerializeField] private bool autoGenerateMatrixFromGleyWhenMissing = true;
-        [SerializeField] private bool saveGeneratedMatrixAssetInEditor;
+        [SerializeField, InspectorName("Matrix Resource")] private string travelTimeMatrixResourceName = "drt_stop_travel_time_matrix";
+        [SerializeField, InspectorName("Matrix Speed")] private float matrixNominalSpeedMetersPerSecond = 15f;
+        [HideInInspector, SerializeField] private bool preferGeneratedMatrixFromGley = true;
+        [HideInInspector, SerializeField] private bool autoGenerateMatrixFromGleyWhenMissing = true;
+        [HideInInspector, SerializeField] private bool saveGeneratedMatrixAssetInEditor;
         [Tooltip("Suppresses routine Unity logs while Matrix Teleport is active. Applies to training, ONNX inference, and vanilla policies.")]
-        [InspectorName("Suppress Unity Logs During Matrix Teleport")]
-        [SerializeField] private bool suppressUnityLogsDuringMatrixTraining = true;
+        [HideInInspector, SerializeField] private bool suppressUnityLogsDuringMatrixTraining = true;
 
         [Header("Episode CSV Export")]
         [FormerlySerializedAs("exportInferenceCsvOnEpisodeEnd")]
-        [SerializeField] private bool exportEpisodeCsvOnEpisodeEnd = true;
-        [SerializeField] private float vehicleTraceSampleIntervalSeconds = 1f;
+        [SerializeField, InspectorName("Export CSV")] private bool exportEpisodeCsvOnEpisodeEnd = true;
+        [HideInInspector, SerializeField] private float vehicleTraceSampleIntervalSeconds = 1f;
 
-        [Header("Diagnostics")]
-        [SerializeField] private bool logMatrixTravel = true;
-        [SerializeField] private bool logEpisodeSummary = true;
-        [SerializeField] private bool logReward = true;
-        [SerializeField] private bool logDecision = true;
-        [SerializeField] private bool logPolicyAction = true;
-        [SerializeField] private bool logSpawnedRequests;
-        [SerializeField] private bool logStopProcessing = true;
-        [SerializeField] private bool logMovementDiagnostics;
-        [SerializeField] private float movementDiagnosticsIntervalSeconds = 2f;
+        [HideInInspector, SerializeField] private bool logMatrixTravel = true;
+        [HideInInspector, SerializeField] private bool logEpisodeSummary = true;
+        [HideInInspector, SerializeField] private bool logReward = true;
+        [HideInInspector, SerializeField] private bool logDecision = true;
+        [HideInInspector, SerializeField] private bool logPolicyAction = true;
+        [HideInInspector, SerializeField] private bool logSpawnedRequests;
+        [HideInInspector, SerializeField] private bool logStopProcessing = true;
+        [HideInInspector, SerializeField] private bool logMovementDiagnostics;
+        [HideInInspector, SerializeField] private float movementDiagnosticsIntervalSeconds = 2f;
 
         [Header("Path Visualization")]
-        [SerializeField] private bool showAssignedPath = true;
-        [SerializeField] private bool showAssignedPathInGame = true;
-        [SerializeField] private bool showAssignedPathGizmos = true;
-        [SerializeField] private Color assignedPathColor = new Color(0f, 0.85f, 1f, 0.9f);
-        [SerializeField] private Color assignedPathWaypointColor = new Color(1f, 0.85f, 0f, 0.95f);
-        [SerializeField] private float assignedPathLineWidth = 0.7f;
-        [SerializeField] private float assignedPathWaypointRadius = 1.2f;
-        [SerializeField] private float assignedPathVerticalOffset = 0.35f;
+        [SerializeField, InspectorName("Show Path")] private bool showAssignedPath = true;
+        [HideInInspector, SerializeField] private bool showAssignedPathInGame = true;
+        [HideInInspector, SerializeField] private bool showAssignedPathGizmos = true;
+        [HideInInspector, SerializeField] private Color assignedPathColor = new Color(0f, 0.85f, 1f, 0.9f);
+        [HideInInspector, SerializeField] private Color assignedPathWaypointColor = new Color(1f, 0.85f, 0f, 0.95f);
+        [HideInInspector, SerializeField] private float assignedPathLineWidth = 0.7f;
+        [HideInInspector, SerializeField] private float assignedPathWaypointRadius = 1.2f;
+        [HideInInspector, SerializeField] private float assignedPathVerticalOffset = 0.35f;
 
         [Header("Background Traffic")]
-        [SerializeField] private bool backgroundTrafficEnabledOnStart = true;
-        [SerializeField] private int enabledTrafficDensity = 30;
+        [SerializeField, InspectorName("Enable")] private bool backgroundTrafficEnabledOnStart = true;
+        [SerializeField, InspectorName("Density")] private int enabledTrafficDensity = 30;
 
         [Header("Episode")]
-        [SerializeField] private float episodeLengthSeconds = 3000f;
-        [SerializeField] private float simulationSecondsPerRealSecond = 1f;
-        [SerializeField] private bool stopWhenAllRequestsCompleted = true;
+        [SerializeField, InspectorName("Length (s)")] private float episodeLengthSeconds = 3000f;
+        [SerializeField, InspectorName("Sim Speed")] private float simulationSecondsPerRealSecond = 1f;
+        [SerializeField, InspectorName("Stop When Done")] private bool stopWhenAllRequestsCompleted = true;
 
-        [Header("Failure Safety")]
-        [SerializeField] private bool failEpisodeOnVehicleFault = true;
-        [SerializeField] private float failurePenalty = -1f;
-        [SerializeField] private float noMovementTimeoutRealSeconds = 20f;
+        [HideInInspector, SerializeField] private bool failEpisodeOnVehicleFault = true;
+        [HideInInspector, SerializeField] private float failurePenalty = -1f;
+        [HideInInspector, SerializeField] private float noMovementTimeoutRealSeconds = 20f;
         [Tooltip("A longer timeout used only when Gley reports a normal stop caused by traffic lights, give-way, or obstacles. Set 0 to never fail on traffic waits.")]
-        [SerializeField] private float trafficBlockTimeoutRealSeconds = 180f;
-        [SerializeField] private float minimumVehicleMovementMeters = 1f;
-        [SerializeField] private float maxRoadWaypointDistanceMeters = 30f;
-        [SerializeField] private float fallYThreshold = -10f;
+        [HideInInspector, SerializeField] private float trafficBlockTimeoutRealSeconds = 180f;
+        [HideInInspector, SerializeField] private float minimumVehicleMovementMeters = 1f;
+        [HideInInspector, SerializeField] private float maxRoadWaypointDistanceMeters = 30f;
+        [HideInInspector, SerializeField] private float fallYThreshold = -10f;
 
         private readonly List<DRTStop> stops = new List<DRTStop>();
         private readonly DRTStopTravelTimeMatrix travelTimeMatrix = new DRTStopTravelTimeMatrix();

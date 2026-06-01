@@ -41,25 +41,22 @@ namespace DRT
         private const string Scenario22ResourceName = "drt_scenario_22";
         private const string Scenario30ResourceName = "drt_scenario_30";
 
-        [Header("Scene References")]
-        [SerializeField] private DRTPassengerManager passengerManager;
+        [HideInInspector, SerializeField] private DRTPassengerManager passengerManager;
 
-        [Header("Scenario Source")]
-        [SerializeField] private bool generateOnStart;
-        [SerializeField] private bool clearExistingRequests = true;
-        [SerializeField] private DRTDemandSource demandSource = DRTDemandSource.CsvResourcePreset;
-        [SerializeField] private DRTDemandCsvPreset csvPreset = DRTDemandCsvPreset.Scenario14Passengers;
-        [SerializeField] private TextAsset scenarioCsvAsset;
-        [SerializeField] private string customScenarioResourceName = Scenario14ResourceName;
-        [SerializeField] private bool spawnRequestsAtRequestTime = true;
+        [Header("Scenario")]
+        [HideInInspector, SerializeField] private bool generateOnStart;
+        [HideInInspector, SerializeField] private bool clearExistingRequests = true;
+        [SerializeField, InspectorName("Source")] private DRTDemandSource demandSource = DRTDemandSource.CsvResourcePreset;
+        [SerializeField, InspectorName("CSV Preset")] private DRTDemandCsvPreset csvPreset = DRTDemandCsvPreset.Scenario14Passengers;
+        [SerializeField, InspectorName("CSV Asset")] private TextAsset scenarioCsvAsset;
+        [SerializeField, InspectorName("Custom Resource")] private string customScenarioResourceName = Scenario14ResourceName;
+        [HideInInspector, SerializeField] private bool spawnRequestsAtRequestTime = true;
 
-        [Header("Fallback / Manual Demand")]
         [HideInInspector, SerializeField] private int stopCount = 8;
         [HideInInspector, SerializeField] private float episodeLengthSeconds = 3000f;
-        [SerializeField, Range(6, 30)] private int defaultRequestCount = 14;
-        [SerializeField] private List<DRTDemandScheduleEntry> demandSchedule = new List<DRTDemandScheduleEntry>();
+        [HideInInspector, SerializeField, Range(6, 30)] private int defaultRequestCount = 14;
+        [HideInInspector, SerializeField] private List<DRTDemandScheduleEntry> demandSchedule = new List<DRTDemandScheduleEntry>();
 
-        [Header("Diagnostics")]
         [HideInInspector, SerializeField] private bool logSpawnedRequests;
 
         private readonly List<DRTDemandReplayEntry> replaySchedule = new List<DRTDemandReplayEntry>();

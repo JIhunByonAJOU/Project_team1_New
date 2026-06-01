@@ -6,11 +6,11 @@ namespace DRT
 {
     public class DRTDebugGUI : MonoBehaviour
     {
-        [SerializeField] private DRTPassengerManager passengerManager;
-        [SerializeField] private DRTBusController busController;
-        [SerializeField] private bool showPassengerTable = true;
-        [SerializeField] private bool showStopOverview = true;
-        [SerializeField] private int maxPassengerRows = 40;
+        [HideInInspector, SerializeField] private DRTPassengerManager passengerManager;
+        [HideInInspector, SerializeField] private DRTBusController busController;
+        [SerializeField, InspectorName("Passenger Table")] private bool showPassengerTable = true;
+        [SerializeField, InspectorName("Stop Overview")] private bool showStopOverview = true;
+        [SerializeField, InspectorName("Max Rows")] private int maxPassengerRows = 40;
 
         private Vector2 passengerScroll;
         private Vector2 overviewScroll;

@@ -16,41 +16,36 @@ namespace DRT
         private const int GlobalObservationCount = 6;
         private const int ObservationsPerStop = 8;
 
-        [Header("PPO Decision Space")]
-        [SerializeField] private DRTBusController busController;
-        [SerializeField, Min(2)] private int maxStops = 16;
-        [SerializeField] private bool skipCurrentStop = true;
+        [HideInInspector, SerializeField] private DRTBusController busController;
+        [HideInInspector, SerializeField, Min(2)] private int maxStops = 16;
+        [HideInInspector, SerializeField] private bool skipCurrentStop = true;
         [HideInInspector, SerializeField] private float episodeLengthSeconds = 3000f;
-        [SerializeField] private float maxDistanceForObservation = 500f;
-        [SerializeField] private float maxTravelSecondsForObservation = 1800f;
-        [SerializeField] private float maxWaitSecondsForObservation = 1800f;
-        [SerializeField] private float maxDecisionWaitSeconds = 1f;
+        [HideInInspector, SerializeField] private float maxDistanceForObservation = 500f;
+        [HideInInspector, SerializeField] private float maxTravelSecondsForObservation = 1800f;
+        [HideInInspector, SerializeField] private float maxWaitSecondsForObservation = 1800f;
+        [HideInInspector, SerializeField] private float maxDecisionWaitSeconds = 1f;
 
-        [Header("Next Stop Policy")]
-        [SerializeField] private DRTNextStopPolicy nextStopPolicy = DRTNextStopPolicy.MLAgentsTraining;
+        [Header("Policy")]
+        [SerializeField, InspectorName("Mode")] private DRTNextStopPolicy nextStopPolicy = DRTNextStopPolicy.MLAgentsTraining;
         [Tooltip("Used only when Next Stop Policy is ONNX Inference. Import the .onnx under Assets first, then assign it here.")]
-        [SerializeField] private NNModel onnxInferenceModel;
-        [SerializeField] private InferenceDevice onnxInferenceDevice = InferenceDevice.Default;
+        [SerializeField, InspectorName("ONNX Model")] private NNModel onnxInferenceModel;
+        [HideInInspector, SerializeField] private InferenceDevice onnxInferenceDevice = InferenceDevice.Default;
 
-        [Header("Paper Reward")]
-        [SerializeField] private float unboardedPassengerPenaltyWeight = 1f;
-        [SerializeField] private float boardingRewardWeight = 1f;
-        [SerializeField] private float dropoffRewardWeight = 1f;
-        [SerializeField] private float acceptableWaitSeconds = 100f;
-        [SerializeField] private float acceptableWaitRewardMultiplier = 5f;
-        [SerializeField] private float networkDistanceUnitsPerMinute = 100f;
-        [SerializeField] private float minimumNetworkAverageReward = 0.01f;
-        [SerializeField] private float invalidActionPenalty = 0f;
+        [HideInInspector, SerializeField] private float unboardedPassengerPenaltyWeight = 1f;
+        [HideInInspector, SerializeField] private float boardingRewardWeight = 1f;
+        [HideInInspector, SerializeField] private float dropoffRewardWeight = 1f;
+        [HideInInspector, SerializeField] private float acceptableWaitSeconds = 100f;
+        [HideInInspector, SerializeField] private float acceptableWaitRewardMultiplier = 5f;
+        [HideInInspector, SerializeField] private float networkDistanceUnitsPerMinute = 100f;
+        [HideInInspector, SerializeField] private float minimumNetworkAverageReward = 0.01f;
+        [HideInInspector, SerializeField] private float invalidActionPenalty = 0f;
         [HideInInspector, SerializeField] private bool logReward = true;
 
-        [Header("Heuristic Fallback")]
-        [SerializeField] private float waitingPassengerWeight = 3f;
-        [SerializeField] private float onBoardDestinationWeight = 5f;
-        [SerializeField] private float scheduledPassengerWeight = 0.5f;
-        [SerializeField] private float distancePenaltyWeight = 0.002f;
+        [HideInInspector, SerializeField] private float waitingPassengerWeight = 3f;
+        [HideInInspector, SerializeField] private float onBoardDestinationWeight = 5f;
+        [HideInInspector, SerializeField] private float scheduledPassengerWeight = 0.5f;
+        [HideInInspector, SerializeField] private float distancePenaltyWeight = 0.002f;
         [HideInInspector, SerializeField] private bool logDecision = true;
-
-        [Header("Diagnostics")]
         [HideInInspector, SerializeField] private bool logPolicyAction = true;
 
         private IReadOnlyList<DRTStop> decisionStops;
