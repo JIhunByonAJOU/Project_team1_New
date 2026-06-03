@@ -146,6 +146,8 @@ namespace DRT
         public int VehicleIndex => vehicleIndex;
         public string ControlledVehicleName => vehicleDriver != null ? vehicleDriver.VehicleName : controlledPlayerVehicle != null ? controlledPlayerVehicle.name : "-";
         public string ControlledDriverName => vehicleDriver != null ? vehicleDriver.GetType().Name : UsesGleyVehicleControl ? nameof(DRTGleyVehicleDriver) : nameof(DRTPlayerVehicleDriver);
+        public Transform ControlledVehicleTransform => GetControlledVehicleTransform();
+        public Vector3 ControlledVehicleBodyPosition => GetControlledVehicleBodyPosition();
         public int AssignedPathPointCount => assignedPathPoints.Count;
         public float AssignedPathDistanceMeters => assignedPathDistanceMeters;
         public bool IsVehicleTemporarilyBlocked => vehicleDriver != null && vehicleDriver.IsTemporarilyBlocked;
