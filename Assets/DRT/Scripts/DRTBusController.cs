@@ -232,7 +232,7 @@ namespace DRT
             driving = false;
             episodeFinished = false;
             waitingForArrivalProximity = false;
-            currentStopId = startStopId;
+            currentStopId = ResolveEpisodeStartStopId();
             targetStopId = 0;
             ClearAssignedPathVisualization();
             ResetEpisodeExportState();
@@ -259,7 +259,7 @@ namespace DRT
             }
 
             int requestCount = passengerManager != null ? passengerManager.Requests.Count : 0;
-            LogInfo($"[BUSCONTROLLER] Episode reset. index={episodeIndex}, requests={requestCount}, startStop={startStopId}");
+            LogInfo($"[BUSCONTROLLER] Episode reset. index={episodeIndex}, requests={requestCount}, startStop={currentStopId}");
         }
 
         private void Update()
@@ -399,6 +399,118 @@ namespace DRT
             }
         }
 
+        private int ResolveEpisodeStartStopId()
+        {
+            int resolvedStartStopId = startStopId;
+            if (!UsesAllStationRunner || nextStopSelector == null)
+            {
+                return resolvedStartStopId;
+            }
+
+            HashSet<string> completedPairKeys = LoadCompletedAllStationPairKeysFromSampleExports();
+            nextStopSelector.ConfigureAllStationResume(completedPairKeys, startStopId);
+
+            if (nextStopSelector.TryGetAllStationResumeStart(
+                    stops,
+                    startStopId,
+                    out int resumeStartStopId,
+                    out int resumeTargetStopId,
+                    out int skippedEdgeCount,
+                    out int totalEdgeCount))
+            {
+                resolvedStartStopId = resumeStartStopId;
+                LogInfo(
+                    $"[BUSCONTROLLER] AllStation resume enabled. " +
+                    $"completedPairs={completedPairKeys.Count}, skippedPrefix={skippedEdgeCount}/{totalEdgeCount}, " +
+                    $"start={resumeStartStopId}, next={resumeTargetStopId}");
+            }
+            else
+            {
+                LogInfo(
+                    $"[BUSCONTROLLER] AllStation resume found no remaining route edge. " +
+                    $"completedPairs={completedPairKeys.Count}, start={resumeStartStopId}, skippedPrefix={skippedEdgeCount}/{totalEdgeCount}");
+                resolvedStartStopId = resumeStartStopId > 0 ? resumeStartStopId : startStopId;
+            }
+
+            return resolvedStartStopId;
+        }
+
+        private HashSet<string> LoadCompletedAllStationPairKeysFromSampleExports()
+        {
+            var completedPairKeys = new HashSet<string>();
+            string exportRoot = GetAllStationExportRootPath();
+            if (string.IsNullOrWhiteSpace(exportRoot) || !Directory.Exists(exportRoot))
+            {
+                return completedPairKeys;
+            }
+
+            string[] sampleFiles;
+            try
+            {
+                sampleFiles = Directory.GetFiles(exportRoot, "*_matrix_samples.csv", SearchOption.AllDirectories);
+            }
+            catch (Exception exception)
+            {
+                Debug.LogWarning($"[BUSCONTROLLER] Failed to scan AllStation matrix sample exports. path={exportRoot}, error={exception.Message}");
+                return completedPairKeys;
+            }
+
+            for (int i = 0; i < sampleFiles.Length; i++)
+            {
+                AddCompletedPairsFromSampleCsv(sampleFiles[i], completedPairKeys);
+            }
+
+            return completedPairKeys;
+        }
+
+        private void AddCompletedPairsFromSampleCsv(string sampleCsvPath, HashSet<string> completedPairKeys)
+        {
+            if (string.IsNullOrWhiteSpace(sampleCsvPath) || completedPairKeys == null)
+            {
+                return;
+            }
+
+            string[] lines;
+            try
+            {
+                lines = File.ReadAllLines(sampleCsvPath);
+            }
+            catch (Exception exception)
+            {
+                Debug.LogWarning($"[BUSCONTROLLER] Failed to read AllStation matrix sample CSV. path={sampleCsvPath}, error={exception.Message}");
+                return;
+            }
+
+            for (int lineIndex = 1; lineIndex < lines.Length; lineIndex++)
+            {
+                string line = lines[lineIndex];
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    continue;
+                }
+
+                string[] columns = line.Split(',');
+                if (columns.Length < 3 ||
+                    !int.TryParse(columns[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out int fromStopId) ||
+                    !int.TryParse(columns[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int toStopId) ||
+                    !int.TryParse(columns[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out int sampleCount) ||
+                    sampleCount <= 0)
+                {
+                    continue;
+                }
+
+                completedPairKeys.Add(BuildStopPairKey(fromStopId, toStopId));
+            }
+        }
+
+        private static string GetAllStationExportRootPath()
+        {
+            string projectRoot = System.IO.Path.GetDirectoryName(Application.dataPath);
+            return string.IsNullOrWhiteSpace(projectRoot)
+                ? null
+                : System.IO.Path.Combine(projectRoot, "DRT_Episode_Exports", "all_station");
+        }
+
         private void WireDemandGenerator()
         {
             if (demandGenerator == null)
@@ -535,7 +647,7 @@ namespace DRT
             }
 
             initialized = true;
-            currentStopId = startStopId;
+            currentStopId = ResolveEpisodeStartStopId();
             targetStopId = 0;
             EnsureBackgroundTrafficStateInitialized();
             ApplyBackgroundTrafficState();
@@ -554,7 +666,7 @@ namespace DRT
                 $"policy={NextStopPolicyName}, " +
                 $"driver={ControlledDriverName}, vehicle={ControlledVehicleName}, " +
                 $"gleyControl={UsesGleyVehicleControl}, gleySpeedMultiplier={gleyControlledVehicleSpeedMultiplier:0.00}, " +
-                $"firstTargetHint={startStopId}");
+                $"firstTargetHint={currentStopId}");
             SendToNextStop();
         }
 
@@ -646,7 +758,7 @@ namespace DRT
             driving = false;
             waitingForArrivalProximity = false;
             targetStopId = 0;
-            currentStopId = startStopId;
+            currentStopId = ResolveEpisodeStartStopId();
             ClearAssignedPathVisualization();
 
             if (stops.Count < 2)
@@ -813,7 +925,8 @@ namespace DRT
             }
 
             DRTStop startStop = null;
-            if (!TryGetStop(startStopId, out startStop) && stops.Count > 0)
+            int startCandidateStopId = currentStopId > 0 ? currentStopId : startStopId;
+            if (!TryGetStop(startCandidateStopId, out startStop) && stops.Count > 0)
             {
                 startStop = stops[0];
             }
