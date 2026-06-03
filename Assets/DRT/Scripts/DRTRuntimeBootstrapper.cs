@@ -41,9 +41,11 @@ namespace DRT
             var demandGenerator = GetOrAdd<DRTDemandGenerator>(systemObject);
             var nextStopSelector = GetOrAdd<DRTNextStopSelector>(systemObject);
             var busController = GetOrAdd<DRTBusController>(systemObject);
+            var dotVisualizer = GetOrAdd<DRTPassengerDotVisualizer>(systemObject);
             var debugGui = GetOrAdd<DRTDebugGUI>(systemObject);
 
             busController.Configure(busStopsRoot, passengerManager, demandGenerator, nextStopSelector, 0, 1);
+            dotVisualizer.Configure(passengerManager, busController);
             debugGui.Configure(passengerManager, busController);
 
             int loadedStopCount = busController.Stops != null ? busController.Stops.Count : busStopsRoot.childCount;

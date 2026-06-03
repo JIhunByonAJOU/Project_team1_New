@@ -845,7 +845,7 @@ namespace Gley.TrafficSystem
 
         private void FixedUpdate()
         {
-            if (!_initialized)
+            if (!_initialized || !_excludedWheels.IsCreated || !_wheelSuspensionPosition.IsCreated || _vehicleRigidbody == null || _vehicleRigidbody.Length == 0 || _suspensionConnectPoints.length == 0)
                 return;
 
             #region Suspensions
