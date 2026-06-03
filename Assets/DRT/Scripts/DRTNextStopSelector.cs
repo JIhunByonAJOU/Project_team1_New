@@ -60,8 +60,10 @@ namespace DRT
         private int episodeStopArrivalCount;
         private float episodeRewardTotal;
         private readonly List<int> allStationRoute = new List<int>();
+        private readonly HashSet<string> allStationCompletedPairKeys = new HashSet<string>();
         private string allStationRouteSignature = string.Empty;
         private int allStationRouteCursor;
+        private int allStationRouteStartStopId;
         private bool allStationRunComplete;
 
         public float MaxDecisionWaitSeconds => maxDecisionWaitSeconds;
@@ -102,6 +104,56 @@ namespace DRT
             logReward = newLogReward;
             logDecision = newLogDecision;
             logPolicyAction = newLogPolicyAction;
+        }
+
+        public void ConfigureAllStationResume(IEnumerable<string> completedPairKeys, int routeStartStopId)
+        {
+            allStationCompletedPairKeys.Clear();
+            if (completedPairKeys != null)
+            {
+                foreach (string pairKey in completedPairKeys)
+                {
+                    if (!string.IsNullOrWhiteSpace(pairKey))
+                    {
+                        allStationCompletedPairKeys.Add(pairKey);
+                    }
+                }
+            }
+
+            allStationRouteStartStopId = Mathf.Max(1, routeStartStopId);
+            ResetAllStationRunnerState();
+        }
+
+        public bool TryGetAllStationResumeStart(
+            IReadOnlyList<DRTStop> stops,
+            int fallbackStartStopId,
+            out int resumeStartStopId,
+            out int resumeTargetStopId,
+            out int skippedEdgeCount,
+            out int totalEdgeCount)
+        {
+            resumeStartStopId = Mathf.Max(1, fallbackStartStopId);
+            resumeTargetStopId = -1;
+            skippedEdgeCount = 0;
+            totalEdgeCount = 0;
+
+            List<int> route = BuildAllStationRouteForResume(stops, fallbackStartStopId);
+            totalEdgeCount = Mathf.Max(0, route.Count - 1);
+            if (route.Count < 2)
+            {
+                return false;
+            }
+
+            skippedEdgeCount = CountCompletedRoutePrefix(route);
+            if (skippedEdgeCount >= route.Count - 1)
+            {
+                resumeStartStopId = route[route.Count - 1];
+                return false;
+            }
+
+            resumeStartStopId = route[skippedEdgeCount];
+            resumeTargetStopId = route[skippedEdgeCount + 1];
+            return true;
         }
 
         public override void OnEpisodeBegin()
@@ -1064,8 +1116,10 @@ namespace DRT
                 return;
             }
 
-            int startStopId = stopIds.Contains(currentStopId) ? currentStopId : stopIds[0];
+            int preferredStartStopId = allStationRouteStartStopId > 0 ? allStationRouteStartStopId : currentStopId;
+            int startStopId = stopIds.Contains(preferredStartStopId) ? preferredStartStopId : stopIds[0];
             BuildEulerianAllStationRoute(stopIds, startStopId, allStationRoute);
+            TrimCompletedAllStationRoutePrefix(allStationRoute);
             allStationRunComplete = allStationRoute.Count <= 1;
         }
 
@@ -1134,7 +1188,53 @@ namespace DRT
             }
         }
 
-        private static string BuildAllStationRouteSignature(IReadOnlyList<DRTStop> stops)
+        private List<int> BuildAllStationRouteForResume(IReadOnlyList<DRTStop> stops, int fallbackStartStopId)
+        {
+            var route = new List<int>();
+            List<int> stopIds = GetSortedStopIds(stops);
+            if (stopIds.Count < 2)
+            {
+                return route;
+            }
+
+            int preferredStartStopId = allStationRouteStartStopId > 0 ? allStationRouteStartStopId : fallbackStartStopId;
+            int startStopId = stopIds.Contains(preferredStartStopId) ? preferredStartStopId : stopIds[0];
+            BuildEulerianAllStationRoute(stopIds, startStopId, route);
+            return route;
+        }
+
+        private void TrimCompletedAllStationRoutePrefix(List<int> route)
+        {
+            int completedPrefix = CountCompletedRoutePrefix(route);
+            if (completedPrefix > 0)
+            {
+                route.RemoveRange(0, completedPrefix);
+            }
+        }
+
+        private int CountCompletedRoutePrefix(IReadOnlyList<int> route)
+        {
+            if (route == null || route.Count < 2 || allStationCompletedPairKeys.Count == 0)
+            {
+                return 0;
+            }
+
+            int completedPrefix = 0;
+            while (completedPrefix < route.Count - 1 &&
+                   allStationCompletedPairKeys.Contains(BuildStopPairKey(route[completedPrefix], route[completedPrefix + 1])))
+            {
+                completedPrefix++;
+            }
+
+            return completedPrefix;
+        }
+
+        public static string BuildStopPairKey(int fromStopId, int toStopId)
+        {
+            return $"{fromStopId}->{toStopId}";
+        }
+
+        private string BuildAllStationRouteSignature(IReadOnlyList<DRTStop> stops)
         {
             List<int> stopIds = GetSortedStopIds(stops);
             var builder = new StringBuilder();
@@ -1146,6 +1246,23 @@ namespace DRT
                 }
 
                 builder.Append(stopIds[i]);
+            }
+
+            builder.Append("#start=").Append(allStationRouteStartStopId);
+            if (allStationCompletedPairKeys.Count > 0)
+            {
+                builder.Append("#done=");
+                var completedPairKeys = new List<string>(allStationCompletedPairKeys);
+                completedPairKeys.Sort();
+                for (int i = 0; i < completedPairKeys.Count; i++)
+                {
+                    if (i > 0)
+                    {
+                        builder.Append(',');
+                    }
+
+                    builder.Append(completedPairKeys[i]);
+                }
             }
 
             return builder.ToString();
