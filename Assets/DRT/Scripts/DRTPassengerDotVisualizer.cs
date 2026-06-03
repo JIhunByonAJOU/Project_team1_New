@@ -12,15 +12,15 @@ namespace DRT
         [Header("Dots")]
         [SerializeField, InspectorName("Show Stops")] private bool showStopDots = true;
         [SerializeField, InspectorName("Show Bus")] private bool showBusDots = true;
-        [SerializeField, InspectorName("Dot Radius")] private float dotRadius = 4.5f;
-        [SerializeField, InspectorName("Dot Spacing")] private float dotSpacing = 3.5f;
-        [SerializeField, InspectorName("Bus Dot Spacing")] private float busDotSpacing = 4.0f;
-        [SerializeField, InspectorName("Dots Per Row")] private int dotsPerRow = 4;
+        [SerializeField, InspectorName("Dot Radius")] private float dotRadius = 6f;
+        [SerializeField, InspectorName("Dot Spacing")] private float dotSpacing = 18f;
+        [SerializeField, InspectorName("Bus Dot Spacing")] private float busDotSpacing = 20f;
+        [SerializeField, InspectorName("Dots Per Row")] private int dotsPerRow = 3;
         [SerializeField, InspectorName("Max Dots")] private int maxDotsPerGroup = 80;
         [SerializeField, InspectorName("Stop Height")] private float stopVerticalOffset = 8f;
         [SerializeField, InspectorName("Bus Height")] private float busVerticalOffset = 8f;
         [SerializeField, InspectorName("Stop Forward Offset")] private float stopForwardOffset = 0.5f;
-        [SerializeField, InspectorName("Stop Side Offset")] private float stopSideOffset = 2.2f;
+        [SerializeField, InspectorName("Stop Side Offset")] private float stopSideOffset = 12f;
         [SerializeField, InspectorName("Bus Forward Offset")] private float busForwardOffset = 0f;
         [SerializeField, InspectorName("Bus Side Offset")] private float busSideOffset = 0f;
 
@@ -72,10 +72,47 @@ namespace DRT
 
                 Vector3 right = stop.transform.right.sqrMagnitude > 0.001f ? stop.transform.right.normalized : Vector3.right;
                 Vector3 forward = stop.transform.forward.sqrMagnitude > 0.001f ? stop.transform.forward.normalized : Vector3.forward;
-                Vector3 center = stop.Position + Vector3.up * stopVerticalOffset + right * stopSideOffset + forward * stopForwardOffset;
-
-                DrawDotGrid(center, right, forward, waitingCount, dotSpacing);
+                Vector3 labelPosition;
+                if (TryGetStopLabelWorldPosition(stop, out labelPosition))
+                {
+                    Vector3 center = labelPosition + right * (stopSideOffset + dotRadius * 1.2f);
+                    DrawDotGrid(center, right, forward, waitingCount, dotSpacing);
+                }
+                else
+                {
+                    Vector3 center = stop.Position + Vector3.up * stopVerticalOffset + right * stopSideOffset + forward * stopForwardOffset;
+                    DrawDotGrid(center, right, forward, waitingCount, dotSpacing);
+                }
             }
+        }
+
+        private bool TryGetStopLabelWorldPosition(DRTStop stop, out Vector3 labelPosition)
+        {
+            var textMesh = stop.GetComponentInChildren<TextMesh>();
+            if (textMesh != null)
+            {
+                labelPosition = textMesh.transform.position;
+                return true;
+            }
+
+            var allComponents = stop.GetComponentsInChildren<Component>(true);
+            foreach (var component in allComponents)
+            {
+                if (component == null)
+                {
+                    continue;
+                }
+
+                string componentName = component.GetType().Name;
+                if (componentName.Contains("TextMeshPro"))
+                {
+                    labelPosition = component.transform.position;
+                    return true;
+                }
+            }
+
+            labelPosition = Vector3.zero;
+            return false;
         }
 
         private void DrawBusDots()
