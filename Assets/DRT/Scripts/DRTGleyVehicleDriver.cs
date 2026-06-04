@@ -25,6 +25,8 @@ namespace DRT
         public Vector3 BodyPosition => GetBodyPosition();
         public bool IsTemporarilyBlocked => TryGetTemporaryBlockReason(out _);
         public string TemporaryBlockReason => TryGetTemporaryBlockReason(out string reason) ? reason : string.Empty;
+        public bool HasCriticalFault => false;
+        public string CriticalFaultReason => string.Empty;
 
         public float CurrentSpeedMS
         {
@@ -109,6 +111,10 @@ namespace DRT
                 vehicleComponent.SetVelocity(Vector3.zero, Vector3.zero);
                 ApplySpeedMultiplier();
             }
+        }
+
+        public void ClearCriticalFault()
+        {
         }
 
         private void ApplySpeedMultiplier()

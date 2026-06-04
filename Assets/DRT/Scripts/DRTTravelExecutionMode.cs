@@ -11,6 +11,27 @@ namespace DRT
         PhysicalDrive
     }
 
+    public enum DRTPhysicalDriveMode
+    {
+        [InspectorName("Gley")]
+        Gley,
+
+        [InspectorName("PPO Autonomous")]
+        PPOAutonomous
+    }
+
+    public enum DRTPPODrivePolicy
+    {
+        [InspectorName("ML-Agents Training")]
+        MLAgentsTraining,
+
+        [InspectorName("ONNX Inference")]
+        ONNXInference,
+
+        [InspectorName("Heuristic Pure Pursuit")]
+        HeuristicPurePursuit
+    }
+
     public enum DRTNextStopPolicy
     {
         [InspectorName("ML-Agents Training")]

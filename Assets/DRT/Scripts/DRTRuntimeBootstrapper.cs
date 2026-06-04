@@ -52,6 +52,7 @@ namespace DRT
             Debug.Log(
                 $"[DRT] Auto setup complete. Stops={loadedStopCount}, " +
                 $"systemObject={systemObject.name}, mode={busController.TravelExecutionModeName}, " +
+                $"physicalDriver={busController.PhysicalDriveModeName}, ppoPolicy={busController.PPODrivePolicyName}, " +
                 $"policy={nextStopSelector.NextStopPolicyName}");
         }
 

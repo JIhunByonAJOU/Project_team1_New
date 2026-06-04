@@ -22,8 +22,11 @@ namespace DRT.Editor
         private const string StartTimeKey = "DRT_SMOKE_START_TIME";
         private const string DurationKey = "DRT_SMOKE_DURATION";
         private const string TravelModeKey = "DRT_SMOKE_TRAVEL_MODE";
+        private const string PhysicalDriveModeKey = "DRT_SMOKE_PHYSICAL_DRIVE_MODE";
+        private const string PPODrivePolicyKey = "DRT_SMOKE_PPO_DRIVE_POLICY";
         private const string PolicyKey = "DRT_SMOKE_POLICY";
         private const string OnnxModelPathKey = "DRT_SMOKE_ONNX_MODEL_PATH";
+        private const string PPOOnnxModelPathKey = "DRT_SMOKE_PPO_ONNX_MODEL_PATH";
         private const string ScenePathKey = "DRT_SMOKE_SCENE_PATH";
         private const string LabelKey = "DRT_SMOKE_LABEL";
         private const string ConfigAppliedKey = "DRT_SMOKE_CONFIG_APPLIED";
@@ -201,8 +204,11 @@ namespace DRT.Editor
         {
             SessionState.SetFloat(DurationKey, (float)SmokeDurationSeconds);
             SessionState.SetString(TravelModeKey, string.Empty);
+            SessionState.SetString(PhysicalDriveModeKey, string.Empty);
+            SessionState.SetString(PPODrivePolicyKey, string.Empty);
             SessionState.SetString(PolicyKey, string.Empty);
             SessionState.SetString(OnnxModelPathKey, string.Empty);
+            SessionState.SetString(PPOOnnxModelPathKey, string.Empty);
             SessionState.SetString(ScenePathKey, string.Empty);
             SessionState.SetString(LabelKey, "-");
             SessionState.SetInt(TargetCompletedRunsKey, 0);
@@ -234,6 +240,14 @@ namespace DRT.Editor
                 {
                     SessionState.SetString(TravelModeKey, value);
                 }
+                else if (key.Equals("physicalDriveMode", StringComparison.OrdinalIgnoreCase))
+                {
+                    SessionState.SetString(PhysicalDriveModeKey, value);
+                }
+                else if (key.Equals("ppoDrivePolicy", StringComparison.OrdinalIgnoreCase))
+                {
+                    SessionState.SetString(PPODrivePolicyKey, value);
+                }
                 else if (key.Equals("nextStopPolicy", StringComparison.OrdinalIgnoreCase))
                 {
                     SessionState.SetString(PolicyKey, value);
@@ -241,6 +255,10 @@ namespace DRT.Editor
                 else if (key.Equals("onnxModelPath", StringComparison.OrdinalIgnoreCase))
                 {
                     SessionState.SetString(OnnxModelPathKey, value);
+                }
+                else if (key.Equals("ppoOnnxModelPath", StringComparison.OrdinalIgnoreCase))
+                {
+                    SessionState.SetString(PPOOnnxModelPathKey, value);
                 }
                 else if (key.Equals("scenePath", StringComparison.OrdinalIgnoreCase))
                 {
@@ -324,7 +342,8 @@ namespace DRT.Editor
             SessionState.SetBool(ConfigAppliedKey, true);
             Debug.Log(
                 $"[DRT_SMOKE] Applied runtime config. label={SessionState.GetString(LabelKey, "-")}, " +
-                $"mode={busController.TravelExecutionModeName}, policy={nextStopSelector.NextStopPolicyName}");
+                $"mode={busController.TravelExecutionModeName}, physicalDriver={busController.PhysicalDriveModeName}, " +
+                $"ppoPolicy={busController.PPODrivePolicyName}, policy={nextStopSelector.NextStopPolicyName}");
         }
 
         private static void ApplyConfig(
@@ -337,6 +356,19 @@ namespace DRT.Editor
                 SetPrivateField(busController, "travelExecutionMode", travelMode);
             }
 
+            string physicalDriveModeText = SessionState.GetString(PhysicalDriveModeKey, string.Empty);
+            if (Enum.TryParse(physicalDriveModeText, true, out DRTPhysicalDriveMode physicalDriveMode))
+            {
+                SetPrivateField(busController, "physicalDriveMode", physicalDriveMode);
+                SetPrivateField(busController, "useGleyVehicleControlInPhysicalDrive", physicalDriveMode == DRTPhysicalDriveMode.Gley);
+            }
+
+            string ppoDrivePolicyText = SessionState.GetString(PPODrivePolicyKey, string.Empty);
+            if (Enum.TryParse(ppoDrivePolicyText, true, out DRTPPODrivePolicy ppoDrivePolicy))
+            {
+                SetPrivateField(busController, "ppoDrivePolicy", ppoDrivePolicy);
+            }
+
             string policyText = SessionState.GetString(PolicyKey, string.Empty);
             if (Enum.TryParse(policyText, true, out DRTNextStopPolicy policy))
             {
@@ -344,6 +376,7 @@ namespace DRT.Editor
             }
 
             ApplyConfiguredOnnxModel(nextStopSelector);
+            ApplyConfiguredPPOOnnxModel(busController);
 
             nextStopSelector.Configure(busController);
         }
@@ -392,6 +425,32 @@ namespace DRT.Editor
             }
 
             SetPrivateField(nextStopSelector, "onnxInferenceModel", model);
+        }
+
+        private static void ApplyConfiguredPPOOnnxModel(DRTBusController busController)
+        {
+            string modelPath = SessionState.GetString(PPOOnnxModelPathKey, string.Empty);
+            if (string.IsNullOrWhiteSpace(modelPath))
+            {
+                return;
+            }
+
+            string assetPath = NormalizeProjectAssetPath(modelPath);
+            if (string.IsNullOrWhiteSpace(assetPath))
+            {
+                Debug.LogError($"[DRT_SMOKE] PPO ONNX model path is outside this project. path={modelPath}");
+                return;
+            }
+
+            AssetDatabase.ImportAsset(assetPath, ImportAssetOptions.ForceUpdate);
+            var model = AssetDatabase.LoadAssetAtPath<NNModel>(assetPath);
+            if (model == null)
+            {
+                Debug.LogError($"[DRT_SMOKE] Failed to load PPO ONNX NNModel at {assetPath}");
+                return;
+            }
+
+            SetPrivateField(busController, "ppoOnnxInferenceModel", model);
         }
 
         private static string NormalizeProjectAssetPath(string modelPath)
@@ -906,7 +965,14 @@ namespace DRT.Editor
             if (Enum.TryParse(travelModeText, true, out DRTTravelExecutionMode travelMode) &&
                 travelMode == DRTTravelExecutionMode.PhysicalDrive)
             {
-                return "physical";
+                string physicalDriveModeText = SessionState.GetString(PhysicalDriveModeKey, string.Empty);
+                if (Enum.TryParse(physicalDriveModeText, true, out DRTPhysicalDriveMode physicalDriveMode) &&
+                    physicalDriveMode == DRTPhysicalDriveMode.PPOAutonomous)
+                {
+                    return "physical_ppo";
+                }
+
+                return "physical_gley";
             }
 
             return "matrix";
