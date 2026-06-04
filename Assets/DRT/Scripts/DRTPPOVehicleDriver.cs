@@ -41,11 +41,13 @@ namespace DRT
         [SerializeField] private InferenceDevice onnxInferenceDevice = InferenceDevice.Default;
 
         [Header("Control")]
-        [SerializeField] private float baseCruiseSpeedMetersPerSecond = 10f;
-        [SerializeField] private float maxObservationSpeedMetersPerSecond = 25f;
+        [SerializeField] private float baseCruiseSpeedMetersPerSecond = 6f;
+        [SerializeField] private float maxPolicySpeedMetersPerSecond = 7f;
+        [SerializeField] private float speedLimitBrakeInput = -0.45f;
+        [SerializeField] private float maxObservationSpeedMetersPerSecond = 15f;
         [SerializeField] private float maxSteeringAngleForFullInput = 45f;
         [SerializeField] private float hardTurnAngle = 75f;
-        [SerializeField] private float slowDownDistanceMeters = 18f;
+        [SerializeField] private float slowDownDistanceMeters = 24f;
         [SerializeField] private float lookAheadTimeSeconds = 0.35f;
         [SerializeField] private float minLookAheadMeters = 4f;
         [SerializeField] private float maxLookAheadMeters = 16f;
@@ -609,6 +611,12 @@ namespace DRT
                 targetThrottleInput,
                 Mathf.Max(0.1f, throttleInputSmoothing) * Time.fixedDeltaTime);
 
+            float speedLimit = GetPolicySpeedLimit();
+            if (speedLimit > 0f && CurrentSpeedMS > speedLimit)
+            {
+                currentThrottleInput = Mathf.Min(currentThrottleInput, speedLimitBrakeInput);
+            }
+
             playerCar.SetExternalInput(currentSteeringInput, currentThrottleInput, true);
         }
 
@@ -862,6 +870,12 @@ namespace DRT
         private float GetHeuristicTargetSpeed(float absSteeringAngle, float finalDistance)
         {
             float targetSpeed = baseCruiseSpeedMetersPerSecond * Mathf.Max(0.1f, speedMultiplier);
+            float speedLimit = GetPolicySpeedLimit();
+            if (speedLimit > 0f)
+            {
+                targetSpeed = Mathf.Min(targetSpeed, speedLimit);
+            }
+
             if (absSteeringAngle >= hardTurnAngle)
             {
                 targetSpeed *= 0.35f;
@@ -878,6 +892,13 @@ namespace DRT
             }
 
             return Mathf.Max(0.5f, targetSpeed);
+        }
+
+        private float GetPolicySpeedLimit()
+        {
+            return maxPolicySpeedMetersPerSecond > 0f
+                ? maxPolicySpeedMetersPerSecond
+                : baseCruiseSpeedMetersPerSecond * Mathf.Max(0.1f, speedMultiplier);
         }
 
         private float GetThrottleForTargetSpeed(float targetSpeed, float finalDistance)
@@ -1285,6 +1306,8 @@ namespace DRT
             waypointReachDistanceMeters = Mathf.Max(0.5f, waypointReachDistanceMeters);
             finalReachDistanceMeters = Mathf.Max(0.25f, finalReachDistanceMeters);
             baseCruiseSpeedMetersPerSecond = Mathf.Max(0.5f, baseCruiseSpeedMetersPerSecond);
+            maxPolicySpeedMetersPerSecond = Mathf.Max(0f, maxPolicySpeedMetersPerSecond);
+            speedLimitBrakeInput = Mathf.Clamp(speedLimitBrakeInput, -1f, 0f);
             maxObservationSpeedMetersPerSecond = Mathf.Max(0.5f, maxObservationSpeedMetersPerSecond);
             maxSteeringAngleForFullInput = Mathf.Max(1f, maxSteeringAngleForFullInput);
             hardTurnAngle = Mathf.Max(maxSteeringAngleForFullInput, hardTurnAngle);
