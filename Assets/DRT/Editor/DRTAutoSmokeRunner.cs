@@ -25,6 +25,9 @@ namespace DRT.Editor
         private const string PhysicalDriveModeKey = "DRT_SMOKE_PHYSICAL_DRIVE_MODE";
         private const string PPODrivePolicyKey = "DRT_SMOKE_PPO_DRIVE_POLICY";
         private const string PolicyKey = "DRT_SMOKE_POLICY";
+        private const string PPOTrainingRouteEnabledKey = "DRT_SMOKE_PPO_TRAINING_ROUTE_ENABLED";
+        private const string PPOTrainingRouteStartStopKey = "DRT_SMOKE_PPO_TRAINING_ROUTE_START_STOP";
+        private const string PPOTrainingRouteEndStopKey = "DRT_SMOKE_PPO_TRAINING_ROUTE_END_STOP";
         private const string OnnxModelPathKey = "DRT_SMOKE_ONNX_MODEL_PATH";
         private const string PPOOnnxModelPathKey = "DRT_SMOKE_PPO_ONNX_MODEL_PATH";
         private const string ScenePathKey = "DRT_SMOKE_SCENE_PATH";
@@ -207,6 +210,9 @@ namespace DRT.Editor
             SessionState.SetString(PhysicalDriveModeKey, string.Empty);
             SessionState.SetString(PPODrivePolicyKey, string.Empty);
             SessionState.SetString(PolicyKey, string.Empty);
+            SessionState.SetString(PPOTrainingRouteEnabledKey, string.Empty);
+            SessionState.SetString(PPOTrainingRouteStartStopKey, string.Empty);
+            SessionState.SetString(PPOTrainingRouteEndStopKey, string.Empty);
             SessionState.SetString(OnnxModelPathKey, string.Empty);
             SessionState.SetString(PPOOnnxModelPathKey, string.Empty);
             SessionState.SetString(ScenePathKey, string.Empty);
@@ -251,6 +257,23 @@ namespace DRT.Editor
                 else if (key.Equals("nextStopPolicy", StringComparison.OrdinalIgnoreCase))
                 {
                     SessionState.SetString(PolicyKey, value);
+                }
+                else if (key.Equals("ppoTrainingRouteEnabled", StringComparison.OrdinalIgnoreCase) ||
+                         key.Equals("usePPOTrainingRouteEpisode", StringComparison.OrdinalIgnoreCase))
+                {
+                    SessionState.SetString(PPOTrainingRouteEnabledKey, value);
+                }
+                else if (key.Equals("ppoTrainingRouteStartStop", StringComparison.OrdinalIgnoreCase) ||
+                         key.Equals("ppoTrainingStartStopId", StringComparison.OrdinalIgnoreCase) ||
+                         key.Equals("trainingStartStopId", StringComparison.OrdinalIgnoreCase))
+                {
+                    SessionState.SetString(PPOTrainingRouteStartStopKey, value);
+                }
+                else if (key.Equals("ppoTrainingRouteEndStop", StringComparison.OrdinalIgnoreCase) ||
+                         key.Equals("ppoTrainingEndStopId", StringComparison.OrdinalIgnoreCase) ||
+                         key.Equals("trainingEndStopId", StringComparison.OrdinalIgnoreCase))
+                {
+                    SessionState.SetString(PPOTrainingRouteEndStopKey, value);
                 }
                 else if (key.Equals("onnxModelPath", StringComparison.OrdinalIgnoreCase))
                 {
@@ -343,7 +366,8 @@ namespace DRT.Editor
             Debug.Log(
                 $"[DRT_SMOKE] Applied runtime config. label={SessionState.GetString(LabelKey, "-")}, " +
                 $"mode={busController.TravelExecutionModeName}, physicalDriver={busController.PhysicalDriveModeName}, " +
-                $"ppoPolicy={busController.PPODrivePolicyName}, policy={nextStopSelector.NextStopPolicyName}");
+                $"ppoPolicy={busController.PPODrivePolicyName}, policy={nextStopSelector.NextStopPolicyName}, " +
+                $"ppoRoute={busController.PPOTrainingRouteName}");
         }
 
         private static void ApplyConfig(
@@ -375,10 +399,57 @@ namespace DRT.Editor
                 SetPrivateField(nextStopSelector, "nextStopPolicy", policy);
             }
 
+            string routeEnabledText = SessionState.GetString(PPOTrainingRouteEnabledKey, string.Empty);
+            if (TryParseConfigBool(routeEnabledText, out bool routeEnabled))
+            {
+                SetPrivateField(busController, "usePPOTrainingRouteEpisode", routeEnabled);
+            }
+
+            string routeStartStopText = SessionState.GetString(PPOTrainingRouteStartStopKey, string.Empty);
+            if (int.TryParse(routeStartStopText, NumberStyles.Integer, CultureInfo.InvariantCulture, out int routeStartStopId))
+            {
+                SetPrivateField(busController, "ppoTrainingRouteStartStopId", Mathf.Max(1, routeStartStopId));
+            }
+
+            string routeEndStopText = SessionState.GetString(PPOTrainingRouteEndStopKey, string.Empty);
+            if (int.TryParse(routeEndStopText, NumberStyles.Integer, CultureInfo.InvariantCulture, out int routeEndStopId))
+            {
+                SetPrivateField(busController, "ppoTrainingRouteEndStopId", Mathf.Max(1, routeEndStopId));
+            }
+
             ApplyConfiguredOnnxModel(nextStopSelector);
             ApplyConfiguredPPOOnnxModel(busController);
 
             nextStopSelector.Configure(busController);
+        }
+
+        private static bool TryParseConfigBool(string value, out bool result)
+        {
+            result = false;
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return false;
+            }
+
+            if (value.Equals("1", StringComparison.OrdinalIgnoreCase) ||
+                value.Equals("true", StringComparison.OrdinalIgnoreCase) ||
+                value.Equals("yes", StringComparison.OrdinalIgnoreCase) ||
+                value.Equals("on", StringComparison.OrdinalIgnoreCase))
+            {
+                result = true;
+                return true;
+            }
+
+            if (value.Equals("0", StringComparison.OrdinalIgnoreCase) ||
+                value.Equals("false", StringComparison.OrdinalIgnoreCase) ||
+                value.Equals("no", StringComparison.OrdinalIgnoreCase) ||
+                value.Equals("off", StringComparison.OrdinalIgnoreCase))
+            {
+                result = false;
+                return true;
+            }
+
+            return bool.TryParse(value, out result);
         }
 
         private static void OpenConfiguredSceneIfNeeded()

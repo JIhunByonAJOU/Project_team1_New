@@ -96,6 +96,11 @@ namespace DRT
         [SerializeField, InspectorName("Sim Speed")] private float simulationSecondsPerRealSecond = 1f;
         [SerializeField, InspectorName("Stop When Done")] private bool stopWhenAllRequestsCompleted = true;
 
+        [Header("PPO Training Route")]
+        [SerializeField, InspectorName("Use Route Episode")] private bool usePPOTrainingRouteEpisode;
+        [SerializeField, InspectorName("Route Start Stop")] private int ppoTrainingRouteStartStopId = 1;
+        [SerializeField, InspectorName("Route End Stop")] private int ppoTrainingRouteEndStopId = 4;
+
         [HideInInspector, SerializeField] private bool failEpisodeOnVehicleFault = true;
         [HideInInspector, SerializeField] private float failurePenalty = -1f;
         [HideInInspector, SerializeField] private float noMovementTimeoutRealSeconds = 20f;
@@ -187,6 +192,12 @@ namespace DRT
                                              physicalDriveMode == DRTPhysicalDriveMode.PPOAutonomous;
         public bool UsesPPOVehicleTraining => UsesPPOVehicleControl &&
                                               ppoDrivePolicy == DRTPPODrivePolicy.MLAgentsTraining;
+        public bool UsesPPOTrainingRouteEpisode => IsPPOTrainingRouteEpisodeActive();
+        public int PPOTrainingRouteStartStopId => ppoTrainingRouteStartStopId;
+        public int PPOTrainingRouteEndStopId => ppoTrainingRouteEndStopId;
+        public string PPOTrainingRouteName => UsesPPOTrainingRouteEpisode
+            ? $"Stop {ppoTrainingRouteStartStopId} -> Stop {ppoTrainingRouteEndStopId}"
+            : "off";
         public bool SuppressUnityLogsDuringMatrixTeleport => UsesMatrixTeleport &&
                                                              suppressUnityLogsDuringMatrixTraining;
         public bool SuppressUnityLogsDuringMatrixTraining => SuppressUnityLogsDuringMatrixTeleport;
@@ -420,6 +431,11 @@ namespace DRT
 
         private int ResolveEpisodeStartStopId()
         {
+            if (TryGetPPOTrainingRouteStartStop(out int configuredRouteStartStopId))
+            {
+                return configuredRouteStartStopId;
+            }
+
             int resolvedStartStopId = startStopId;
             if (!UsesAllStationRunner || nextStopSelector == null)
             {
@@ -822,6 +838,7 @@ namespace DRT
                 $"[BUSCONTROLLER] Initialized mode={TravelExecutionModeName}, " +
                 $"physicalDriver={PhysicalDriveModeName}, ppoPolicy={PPODrivePolicyName}, " +
                 $"policy={NextStopPolicyName}, " +
+                $"ppoRoute={PPOTrainingRouteName}, " +
                 $"driver={ControlledDriverName}, vehicle={ControlledVehicleName}, " +
                 $"gleyControl={UsesGleyVehicleControl}, gleySpeedMultiplier={gleyControlledVehicleSpeedMultiplier:0.00}, " +
                 $"firstTargetHint={currentStopId}");
@@ -1202,7 +1219,14 @@ namespace DRT
             passengerManager?.UpdateRequestStates(episodeTimeSeconds);
 
             int nextStopId = -1;
-            if (nextStopSelector.UsesMlAgentsDecisionPolicy)
+            if (TrySelectPPOTrainingRouteStop(out nextStopId))
+            {
+                if (nextStopId < 1)
+                {
+                    yield break;
+                }
+            }
+            else if (nextStopSelector.UsesMlAgentsDecisionPolicy)
             {
                 bool decisionStarted = nextStopSelector.BeginDecision(currentStopId, stops, passengerManager, episodeTimeSeconds);
                 if (decisionStarted)
@@ -1280,6 +1304,7 @@ namespace DRT
                 yield break;
             }
 
+            ConfigurePPOVehicleDestinationEpisodeEnd(nextStop.StopId);
             if (vehicleDriver == null || !vehicleDriver.SetPath(path, servicePoint))
             {
                 driving = false;
@@ -1457,13 +1482,22 @@ namespace DRT
             CompleteActiveRouteLeg(currentStopId, stopResult);
             nextStopSelector.RecordStopArrival(stopResult, episodeTimeSeconds);
 
+            if (ShouldFinishPPOTrainingRouteAtStop(currentStopId))
+            {
+                FinishEpisode($"PPO training route completed. route={PPOTrainingRouteName}");
+                return true;
+            }
+
             if (nextStopSelector.IsAllStationRunComplete)
             {
                 FinishEpisode("All station runner completed.");
                 return true;
             }
 
-            if (!UsesAllStationRunner && stopWhenAllRequestsCompleted && !HasUnfinishedOrPendingRequests())
+            if (!UsesAllStationRunner &&
+                stopWhenAllRequestsCompleted &&
+                !HasUnfinishedOrPendingRequests() &&
+                !ShouldDeferPassengerCompletionFinish())
             {
                 FinishEpisode("All passenger requests completed.");
                 return true;
@@ -1489,6 +1523,140 @@ namespace DRT
                                          passengerManager.HasUnfinishedRequests(episodeTimeSeconds);
             bool hasPendingScenarioDemand = demandGenerator != null && demandGenerator.HasPendingDemand;
             return hasUnfinishedRequests || hasPendingScenarioDemand;
+        }
+
+        private bool ShouldDeferPassengerCompletionFinish()
+        {
+            return IsPPOTrainingRouteEpisodeActive() &&
+                   currentStopId > 0 &&
+                   currentStopId != ppoTrainingRouteEndStopId;
+        }
+
+        private bool IsPPOTrainingRouteEpisodeActive()
+        {
+            return usePPOTrainingRouteEpisode &&
+                   UsesPPOVehicleControl &&
+                   ppoTrainingRouteStartStopId > 0 &&
+                   ppoTrainingRouteEndStopId > 0 &&
+                   ppoTrainingRouteStartStopId != ppoTrainingRouteEndStopId;
+        }
+
+        private bool TryGetPPOTrainingRouteStartStop(out int routeStartStopId)
+        {
+            routeStartStopId = -1;
+            if (!IsPPOTrainingRouteEpisodeActive())
+            {
+                return false;
+            }
+
+            if (TryGetStop(ppoTrainingRouteStartStopId, out _))
+            {
+                routeStartStopId = ppoTrainingRouteStartStopId;
+                return true;
+            }
+
+            Debug.LogWarning(
+                $"[BUSCONTROLLER] PPO training route start stop was not found. " +
+                $"start={ppoTrainingRouteStartStopId}, end={ppoTrainingRouteEndStopId}");
+            return false;
+        }
+
+        private bool TrySelectPPOTrainingRouteStop(out int nextStopId)
+        {
+            nextStopId = -1;
+            if (!IsPPOTrainingRouteEpisodeActive())
+            {
+                return false;
+            }
+
+            if (!TryGetStop(ppoTrainingRouteEndStopId, out _))
+            {
+                FinishEpisode(
+                    $"PPO training route end stop not found. " +
+                    $"start={ppoTrainingRouteStartStopId}, end={ppoTrainingRouteEndStopId}");
+                return true;
+            }
+
+            if (currentStopId == ppoTrainingRouteEndStopId)
+            {
+                FinishEpisode($"PPO training route completed before next leg. route={PPOTrainingRouteName}");
+                return true;
+            }
+
+            nextStopId = GetNextSequentialRouteStopId(currentStopId);
+            if (nextStopId < 1)
+            {
+                FinishEpisode($"No valid next stop for PPO training route. route={PPOTrainingRouteName}, current={currentStopId}");
+                return true;
+            }
+
+            LogInfo(
+                $"[BUSCONTROLLER] PPOTrainingRoute route={PPOTrainingRouteName}, " +
+                $"current={currentStopId}, selected={nextStopId}");
+            return true;
+        }
+
+        private int GetNextSequentialRouteStopId(int stopId)
+        {
+            if (stops == null || stops.Count == 0)
+            {
+                return -1;
+            }
+
+            int currentIndex = -1;
+            int firstValidStopId = -1;
+            for (int i = 0; i < stops.Count; i++)
+            {
+                if (stops[i] == null)
+                {
+                    continue;
+                }
+
+                if (firstValidStopId < 1)
+                {
+                    firstValidStopId = stops[i].StopId;
+                }
+
+                if (stops[i].StopId == stopId)
+                {
+                    currentIndex = i;
+                    break;
+                }
+            }
+
+            if (currentIndex < 0)
+            {
+                return firstValidStopId;
+            }
+
+            for (int offset = 1; offset <= stops.Count; offset++)
+            {
+                DRTStop candidate = stops[(currentIndex + offset) % stops.Count];
+                if (candidate != null)
+                {
+                    return candidate.StopId;
+                }
+            }
+
+            return -1;
+        }
+
+        private bool ShouldFinishPPOTrainingRouteAtStop(int reachedStopId)
+        {
+            return IsPPOTrainingRouteEpisodeActive() &&
+                   reachedStopId == ppoTrainingRouteEndStopId;
+        }
+
+        private void ConfigurePPOVehicleDestinationEpisodeEnd(int nextStopId)
+        {
+            if (!UsesPPOVehicleControl || ppoVehicleDriver == null)
+            {
+                return;
+            }
+
+            bool shouldEndEpisode = !IsPPOTrainingRouteEpisodeActive() ||
+                                    nextStopId == ppoTrainingRouteEndStopId;
+            ppoVehicleDriver.SetEndEpisodeOnDestinationReached(shouldEndEpisode);
         }
 
         private void BeginRouteLeg(int nextStopId, int pathWaypointCount, float plannedPathDistanceMeters)
@@ -2930,6 +3098,9 @@ namespace DRT
             AppendEpisodeRow(builder, "summary", "travel_execution_mode", TravelExecutionModeName);
             AppendEpisodeRow(builder, "summary", "physical_drive_mode", PhysicalDriveModeName);
             AppendEpisodeRow(builder, "summary", "ppo_drive_policy", PPODrivePolicyName);
+            AppendEpisodeRow(builder, "summary", "ppo_training_route_enabled", UsesPPOTrainingRouteEpisode ? "1" : "0");
+            AppendEpisodeRow(builder, "summary", "ppo_training_route_start_stop_id", ppoTrainingRouteStartStopId.ToString(CultureInfo.InvariantCulture));
+            AppendEpisodeRow(builder, "summary", "ppo_training_route_end_stop_id", ppoTrainingRouteEndStopId.ToString(CultureInfo.InvariantCulture));
             AppendEpisodeRow(builder, "summary", "policy", GetNextStopPolicyExportToken());
             AppendEpisodeRow(builder, "summary", "next_stop_policy", NextStopPolicyName);
             AppendEpisodeRow(builder, "summary", "scenario_id", demandGenerator != null ? demandGenerator.ExportScenarioId : string.Empty);
@@ -3225,6 +3396,8 @@ namespace DRT
             enabledTrafficDensity = Mathf.Max(1, enabledTrafficDensity);
             episodeLengthSeconds = Mathf.Max(1f, episodeLengthSeconds);
             simulationSecondsPerRealSecond = Mathf.Max(0.01f, simulationSecondsPerRealSecond);
+            ppoTrainingRouteStartStopId = Mathf.Max(1, ppoTrainingRouteStartStopId);
+            ppoTrainingRouteEndStopId = Mathf.Max(1, ppoTrainingRouteEndStopId);
             movementDiagnosticsIntervalSeconds = Mathf.Max(0.25f, movementDiagnosticsIntervalSeconds);
             noMovementTimeoutRealSeconds = Mathf.Max(1f, noMovementTimeoutRealSeconds);
             trafficBlockTimeoutRealSeconds = Mathf.Max(0f, trafficBlockTimeoutRealSeconds);

@@ -41,10 +41,11 @@ namespace DRT
         [SerializeField] private InferenceDevice onnxInferenceDevice = InferenceDevice.Default;
 
         [Header("Control")]
-        [SerializeField] private float baseCruiseSpeedMetersPerSecond = 6f;
-        [SerializeField] private float maxPolicySpeedMetersPerSecond = 7f;
+        [SerializeField] private float baseCruiseSpeedMetersPerSecond = 5f;
+        [SerializeField] private float maxPolicySpeedMetersPerSecond = 5f;
         [SerializeField] private float speedLimitBrakeInput = -0.45f;
-        [SerializeField] private float maxObservationSpeedMetersPerSecond = 15f;
+        [HideInInspector, SerializeField] private bool endEpisodeOnDestinationReached = true;
+        [SerializeField] private float maxObservationSpeedMetersPerSecond = 12f;
         [SerializeField] private float maxSteeringAngleForFullInput = 45f;
         [SerializeField] private float hardTurnAngle = 75f;
         [SerializeField] private float slowDownDistanceMeters = 24f;
@@ -325,6 +326,11 @@ namespace DRT
         public void ReportExternalCriticalFault(string reason, float penalty)
         {
             RegisterCriticalFault(reason, penalty);
+        }
+
+        public void SetEndEpisodeOnDestinationReached(bool shouldEndEpisode)
+        {
+            endEpisodeOnDestinationReached = shouldEndEpisode;
         }
 
         private void Awake()
@@ -666,9 +672,18 @@ namespace DRT
 
             if (destinationDistance <= finalReachDistanceMeters)
             {
-                AddReward(destinationReward);
-                RecordStat("DRTDrive/DestinationReached", 1f, StatAggregationMethod.Sum);
-                EndEpisode();
+                if (endEpisodeOnDestinationReached)
+                {
+                    AddReward(destinationReward);
+                    RecordStat("DRTDrive/DestinationReached", 1f, StatAggregationMethod.Sum);
+                    EndEpisode();
+                }
+                else
+                {
+                    AddReward(waypointPassedReward);
+                    RecordStat("DRTDrive/IntermediateDestinationReached", 1f, StatAggregationMethod.Sum);
+                }
+
                 StopAndHold(true);
                 return;
             }
