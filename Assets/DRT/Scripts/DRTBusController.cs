@@ -2191,6 +2191,12 @@ namespace DRT
                 return;
             }
 
+            if (TryConsumeVehicleDestinationReached())
+            {
+                BeginDwellAtTarget();
+                return;
+            }
+
             float targetDistance = GetTargetDistanceMeters();
             if (float.IsInfinity(targetDistance))
             {
@@ -2276,6 +2282,11 @@ namespace DRT
 
             LogInfo($"[BUSCONTROLLER] PPO training episode reset after vehicle failure. {reason}");
             ResetEpisodeFromAgent();
+        }
+
+        private bool TryConsumeVehicleDestinationReached()
+        {
+            return ppoVehicleDriver != null && ppoVehicleDriver.ConsumeDestinationReached();
         }
 
         private bool IsTooFarFromTrafficWaypoint(Vector3 position, out float waypointDistance)

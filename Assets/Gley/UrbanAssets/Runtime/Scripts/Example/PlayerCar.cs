@@ -52,7 +52,7 @@ namespace Gley.UrbanSystem
             inputScript = gameObject.AddComponent<UIInputNew>().Initialize();
 #endif
             lightsComponent = gameObject.GetComponent<VehicleLightsComponent>();
-            lightsComponent.Initialize();
+            lightsComponent?.Initialize();
             rb = GetComponent<Rigidbody>();
         }
 
@@ -151,6 +151,11 @@ namespace Gley.UrbanSystem
         private void Update()
         {
             realtimeSinceStartup += Time.deltaTime;
+            if (lightsComponent == null)
+            {
+                return;
+            }
+
             if (GetKeyDownSpace())
             {
                 mainLights = !mainLights;

@@ -116,6 +116,12 @@ namespace DRT
         private bool criticalFault;
         private string criticalFaultReason = string.Empty;
         private bool warnedSharedBehaviorHost;
+        private bool destinationReachedPending;
+        private float episodeAdeSumMeters;
+        private float episodeHeadingErrorSumDegrees;
+        private float episodeMaxAdeMeters;
+        private float episodeMaxHeadingErrorDegrees;
+        private int episodeTrackingMetricSamples;
 
         private int ObservationSize =>
             GlobalObservationCount +
@@ -212,6 +218,7 @@ namespace DRT
             currentSteeringInput = 0f;
             currentThrottleInput = 0f;
             reverseSeconds = 0f;
+            destinationReachedPending = false;
 
             if (waypointIndexes != null)
             {
@@ -287,6 +294,8 @@ namespace DRT
             lastWaypointDistance = 0f;
             lastTargetPointIndex = 0;
             ClearCriticalFault();
+            destinationReachedPending = false;
+            ResetEpisodeTrackingMetrics();
 
             if (playerCar != null)
             {
@@ -299,6 +308,8 @@ namespace DRT
             ResolveReferences();
             StopAndHold(true);
             ClearCriticalFault();
+            destinationReachedPending = false;
+            ResetEpisodeTrackingMetrics();
 
             if (vehicleRigidbody != null)
             {
@@ -331,6 +342,17 @@ namespace DRT
         public void SetEndEpisodeOnDestinationReached(bool shouldEndEpisode)
         {
             endEpisodeOnDestinationReached = shouldEndEpisode;
+        }
+
+        public bool ConsumeDestinationReached()
+        {
+            if (!destinationReachedPending)
+            {
+                return false;
+            }
+
+            destinationReachedPending = false;
+            return true;
         }
 
         private void Awake()
@@ -664,6 +686,9 @@ namespace DRT
             Vector3 bodyPosition = GetBodyPosition();
             float destinationDistance = GetPlanarDistance(bodyPosition, finalDestination);
             float crossTrackError = GetCrossTrackError(bodyPosition, out Vector3 routeTangent);
+            GetHeadingFeatures(routeTangent, out float headingDot, out float headingCross);
+            RecordTrackingMetrics(crossTrackError, headingDot);
+
             if (hardCrossTrackLimitMeters > 0f && crossTrackError > hardCrossTrackLimitMeters)
             {
                 RegisterCriticalFault($"PPO vehicle left assigned route. crossTrackError={crossTrackError:0.00}m", assignedRouteExitPenalty);
@@ -672,10 +697,12 @@ namespace DRT
 
             if (destinationDistance <= finalReachDistanceMeters)
             {
+                destinationReachedPending = true;
                 if (endEpisodeOnDestinationReached)
                 {
                     AddReward(destinationReward);
                     RecordStat("DRTDrive/DestinationReached", 1f, StatAggregationMethod.Sum);
+                    EmitEpisodeTrackingMetrics();
                     EndEpisode();
                 }
                 else
@@ -724,7 +751,6 @@ namespace DRT
             lastWaypointDistance = waypointDistance;
             lastDestinationDistance = destinationDistance;
 
-            GetHeadingFeatures(routeTangent, out float headingDot, out float headingCross);
             float normalizedCrossTrackError = Mathf.Clamp01(crossTrackError / Mathf.Max(0.1f, maxCrossTrackErrorMeters));
             float nextWaypointHeadingDot = GetCurrentWaypointHeadingDot(bodyPosition);
             float curveStrength = GetCurveStrength();
@@ -1164,8 +1190,47 @@ namespace DRT
             criticalFaultReason = string.IsNullOrWhiteSpace(reason) ? "PPO vehicle critical fault." : reason;
             AddReward(penalty);
             RecordStat("DRTDrive/CriticalFault", 1f, StatAggregationMethod.Sum);
+            EmitEpisodeTrackingMetrics();
             EndEpisode();
             StopAndHold(false);
+        }
+
+        private void RecordTrackingMetrics(float crossTrackErrorMeters, float headingDot)
+        {
+            float adeMeters = Mathf.Max(0f, crossTrackErrorMeters);
+            float headingErrorDegrees = Mathf.Acos(Mathf.Clamp(headingDot, -1f, 1f)) * Mathf.Rad2Deg;
+
+            episodeAdeSumMeters += adeMeters;
+            episodeHeadingErrorSumDegrees += headingErrorDegrees;
+            episodeMaxAdeMeters = Mathf.Max(episodeMaxAdeMeters, adeMeters);
+            episodeMaxHeadingErrorDegrees = Mathf.Max(episodeMaxHeadingErrorDegrees, headingErrorDegrees);
+            episodeTrackingMetricSamples++;
+
+            RecordStat("DRTDrive/ADE", adeMeters);
+            RecordStat("DRTDrive/HeadingErrorDeg", headingErrorDegrees);
+        }
+
+        private void EmitEpisodeTrackingMetrics()
+        {
+            if (episodeTrackingMetricSamples <= 0)
+            {
+                return;
+            }
+
+            float sampleCount = Mathf.Max(1, episodeTrackingMetricSamples);
+            RecordStat("DRTDrive/EpisodeMeanADE", episodeAdeSumMeters / sampleCount, StatAggregationMethod.MostRecent);
+            RecordStat("DRTDrive/EpisodeMeanHeadingErrorDeg", episodeHeadingErrorSumDegrees / sampleCount, StatAggregationMethod.MostRecent);
+            RecordStat("DRTDrive/EpisodeMaxADE", episodeMaxAdeMeters, StatAggregationMethod.MostRecent);
+            RecordStat("DRTDrive/EpisodeMaxHeadingErrorDeg", episodeMaxHeadingErrorDegrees, StatAggregationMethod.MostRecent);
+        }
+
+        private void ResetEpisodeTrackingMetrics()
+        {
+            episodeAdeSumMeters = 0f;
+            episodeHeadingErrorSumDegrees = 0f;
+            episodeMaxAdeMeters = 0f;
+            episodeMaxHeadingErrorDegrees = 0f;
+            episodeTrackingMetricSamples = 0;
         }
 
         private void UpdateYawRate()
