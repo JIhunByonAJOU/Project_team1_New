@@ -35,7 +35,7 @@ MonoBehaviour:
     StopWaypointsColor: {r: 1, g: 0, b: 0, a: 1}
     ExitWaypointsColor: {r: 0, g: 1, b: 1, a: 1}
   AgentRoutes:
-    Id: ffffffff
+    Id: 00000000
     RoutesColor:
     - {r: 1, g: 1, b: 1, a: 1}
     Active: 01
@@ -54,10 +54,10 @@ MonoBehaviour:
   ShowVehicles: 0
   ViewOtherRoads: 0
   ViewRoadLanes: 0
-  ViewRoadWaypoints: 0
-  ViewLabels: 0
+  ViewRoadWaypoints: 1
+  ViewLabels: 1
   PathFindingEnabled: 0
-  WaypointDistance: 4
+  WaypointDistance: 1
   LaneWidth: 4
   MoveTool: 1
   speedRoutes:
@@ -66,8 +66,8 @@ MonoBehaviour:
     - {r: 1, g: 1, b: 1, a: 1}
     Active: 01
   showOtherLanes: 1
-  showSpeed: 0
-  viewRoadLaneChanges: 0
+  showSpeed: 1
+  viewRoadLaneChanges: 1
   leftSideTraffic: 0
   maxSpeed: 50
   nrOfLanes: 2
