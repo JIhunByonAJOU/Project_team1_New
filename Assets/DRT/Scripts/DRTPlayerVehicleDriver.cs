@@ -42,6 +42,8 @@ namespace DRT
         public Vector3 BodyPosition => GetBodyPosition();
         public bool IsTemporarilyBlocked => false;
         public string TemporaryBlockReason => string.Empty;
+        public bool HasCriticalFault => false;
+        public string CriticalFaultReason => string.Empty;
 
         public float CurrentSpeedMS
         {
@@ -155,6 +157,10 @@ namespace DRT
         public void TeleportTo(Vector3 position, Quaternion rotation, int nextWaypointIndex)
         {
             TeleportTo(position, rotation);
+        }
+
+        public void ClearCriticalFault()
+        {
         }
 
         private void Awake()

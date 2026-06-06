@@ -57,6 +57,9 @@ namespace DRT
 
         private void DrawStopDots(float currentTime)
         {
+            Vector3 right = GetScreenAlignedRight();
+            Vector3 forward = Vector3.Cross(Vector3.up, right).normalized;
+
             foreach (var stop in busController.Stops)
             {
                 if (stop == null)
@@ -70,20 +73,36 @@ namespace DRT
                     continue;
                 }
 
-                Vector3 right = stop.transform.right.sqrMagnitude > 0.001f ? stop.transform.right.normalized : Vector3.right;
-                Vector3 forward = stop.transform.forward.sqrMagnitude > 0.001f ? stop.transform.forward.normalized : Vector3.forward;
                 Vector3 labelPosition;
                 if (TryGetStopLabelWorldPosition(stop, out labelPosition))
                 {
                     Vector3 center = labelPosition + right * (stopSideOffset + dotRadius * 1.2f);
-                    DrawDotGrid(center, right, forward, waitingCount, dotSpacing);
+                    DrawDotGrid(center, right, forward, waitingCount, dotSpacing, visibleCount: waitingCount, forceSingleRow: true);
                 }
                 else
                 {
                     Vector3 center = stop.Position + Vector3.up * stopVerticalOffset + right * stopSideOffset + forward * stopForwardOffset;
-                    DrawDotGrid(center, right, forward, waitingCount, dotSpacing);
+                    DrawDotGrid(center, right, forward, waitingCount, dotSpacing, visibleCount: waitingCount, forceSingleRow: true);
                 }
             }
+        }
+
+        private Vector3 GetScreenAlignedRight()
+        {
+            Camera cam = Camera.current;
+            if (cam == null)
+            {
+                return Vector3.right;
+            }
+
+            Vector3 screenRight = cam.transform.right;
+            Vector3 horizontalRight = Vector3.ProjectOnPlane(screenRight, Vector3.up);
+            if (horizontalRight.sqrMagnitude < 0.001f)
+            {
+                return Vector3.right;
+            }
+
+            return horizontalRight.normalized;
         }
 
         private bool TryGetStopLabelWorldPosition(DRTStop stop, out Vector3 labelPosition)
@@ -133,21 +152,21 @@ namespace DRT
             Vector3 forward = vehicleTransform.forward.sqrMagnitude > 0.001f ? vehicleTransform.forward.normalized : Vector3.forward;
             Vector3 side = Vector3.Cross(Vector3.up, forward).normalized;
             Vector3 center = bodyPosition + Vector3.up * busVerticalOffset;
-
-            DrawDotGrid(center, side, forward, onBoardCount, busDotSpacing);
+            int busColumns = onBoardCount == 4 ? 2 : dotsPerRow;
+            DrawDotGrid(center, side, forward, onBoardCount, busDotSpacing, visibleCount: onBoardCount, forcedColumns: busColumns);
         }
 
-        private void DrawDotGrid(Vector3 center, Vector3 right, Vector3 forward, int dotCount, float spacing)
+        private void DrawDotGrid(Vector3 center, Vector3 right, Vector3 forward, int dotCount, float spacing, int visibleCount = -1, int forcedColumns = -1, bool forceSingleRow = false)
         {
-            Gizmos.color = Color.red;
-            int visibleCount = Mathf.Clamp(dotCount, 0, maxDotsPerGroup);
-            int columns = Mathf.Max(1, dotsPerRow);
+            Gizmos.color = Color.green;
+            int count = visibleCount < 0 ? Mathf.Clamp(dotCount, 0, maxDotsPerGroup) : Mathf.Clamp(visibleCount, 0, maxDotsPerGroup);
+            int columns = forcedColumns > 0 ? forcedColumns : (forceSingleRow ? Mathf.Max(1, count) : Mathf.Max(1, dotsPerRow));
 
-            for (int i = 0; i < visibleCount; i++)
+            for (int i = 0; i < count; i++)
             {
-                int row = i / columns;
+                int row = forceSingleRow ? 0 : i / columns;
                 int column = i % columns;
-                int rowColumns = Mathf.Min(columns, visibleCount - row * columns);
+                int rowColumns = forceSingleRow ? count : Mathf.Min(columns, count - row * columns);
                 float xOffset = (column - (rowColumns - 1) * 0.5f) * spacing;
                 float zOffset = row * spacing;
                 Vector3 dotPos = center + right.normalized * xOffset + forward.normalized * zOffset;

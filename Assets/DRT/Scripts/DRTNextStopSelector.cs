@@ -61,26 +61,35 @@ namespace DRT
         private int allStationRouteCursor;
         private int allStationRouteStartStopId;
         private bool allStationRunComplete;
+        private bool loggedDriveTrainingBypass;
 
         public float MaxDecisionWaitSeconds => maxDecisionWaitSeconds;
         public int LastSelectedStopId => lastSelectedStopId;
         public DRTNextStopPolicy NextStopPolicy => nextStopPolicy;
         public string NextStopPolicyName => nextStopPolicy.ToString();
         public bool UsesMlAgentsDecisionPolicy =>
+            !BypassMlAgentsDuringDriveTraining &&
             nextStopPolicy != DRTNextStopPolicy.VanillaSequential &&
             nextStopPolicy != DRTNextStopPolicy.AllStationRunner;
         public bool UsesAllStationRunner => nextStopPolicy == DRTNextStopPolicy.AllStationRunner;
         public bool IsAllStationRunComplete => UsesAllStationRunner && allStationRunComplete;
 
         private int ObservationSize => GlobalObservationCount + maxStops * ObservationsPerStop;
+        private bool BypassMlAgentsDuringDriveTraining =>
+            nextStopPolicy == DRTNextStopPolicy.MLAgentsTraining &&
+            busController != null &&
+            busController.UsesPPOVehicleControl &&
+            busController.PPODrivePolicy == DRTPPODrivePolicy.MLAgentsTraining;
 
         private void Awake()
         {
+            ResolveBusController();
             ConfigureBehaviorParameters();
         }
 
         public override void Initialize()
         {
+            ResolveBusController();
             ConfigureBehaviorParameters();
         }
 
@@ -154,6 +163,12 @@ namespace DRT
 
         public override void OnEpisodeBegin()
         {
+            if (BypassMlAgentsDuringDriveTraining)
+            {
+                CancelDecision();
+                return;
+            }
+
             CancelDecision();
             episodeDecisionCount = 0;
             episodeStopArrivalCount = 0;
@@ -833,25 +848,41 @@ namespace DRT
 
             behaviorParameters.hideFlags = HideFlags.HideInInspector;
 
-            switch (nextStopPolicy)
+            if (BypassMlAgentsDuringDriveTraining)
             {
-                case DRTNextStopPolicy.ONNXInference:
-                    behaviorParameters.Model = onnxInferenceModel;
-                    behaviorParameters.InferenceDevice = onnxInferenceDevice;
-                    behaviorParameters.BehaviorType = BehaviorType.InferenceOnly;
-                    break;
-                case DRTNextStopPolicy.VanillaSequential:
-                    behaviorParameters.Model = null;
-                    behaviorParameters.BehaviorType = BehaviorType.HeuristicOnly;
-                    break;
-                case DRTNextStopPolicy.AllStationRunner:
-                    behaviorParameters.Model = null;
-                    behaviorParameters.BehaviorType = BehaviorType.HeuristicOnly;
-                    break;
-                default:
-                    behaviorParameters.Model = null;
-                    behaviorParameters.BehaviorType = BehaviorType.Default;
-                    break;
+                behaviorParameters.enabled = false;
+                behaviorParameters.Model = null;
+                behaviorParameters.BehaviorType = BehaviorType.HeuristicOnly;
+                if (!loggedDriveTrainingBypass)
+                {
+                    Debug.Log("[DRTNextStopSelector] ML-Agents next-stop policy disabled while training DRTDrivePPO.");
+                    loggedDriveTrainingBypass = true;
+                }
+            }
+            else
+            {
+                behaviorParameters.enabled = true;
+                loggedDriveTrainingBypass = false;
+                switch (nextStopPolicy)
+                {
+                    case DRTNextStopPolicy.ONNXInference:
+                        behaviorParameters.Model = onnxInferenceModel;
+                        behaviorParameters.InferenceDevice = onnxInferenceDevice;
+                        behaviorParameters.BehaviorType = BehaviorType.InferenceOnly;
+                        break;
+                    case DRTNextStopPolicy.VanillaSequential:
+                        behaviorParameters.Model = null;
+                        behaviorParameters.BehaviorType = BehaviorType.HeuristicOnly;
+                        break;
+                    case DRTNextStopPolicy.AllStationRunner:
+                        behaviorParameters.Model = null;
+                        behaviorParameters.BehaviorType = BehaviorType.HeuristicOnly;
+                        break;
+                    default:
+                        behaviorParameters.Model = null;
+                        behaviorParameters.BehaviorType = BehaviorType.Default;
+                        break;
+                }
             }
 
             behaviorParameters.BehaviorName = BehaviorName;
