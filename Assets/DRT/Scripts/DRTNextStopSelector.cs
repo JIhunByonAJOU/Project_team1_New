@@ -31,20 +31,18 @@ namespace DRT
         [SerializeField, InspectorName("ONNX Model")] private NNModel onnxInferenceModel;
         [HideInInspector, SerializeField] private InferenceDevice onnxInferenceDevice = InferenceDevice.Default;
 
-        [HideInInspector, SerializeField] private float unboardedPassengerPenaltyWeight = 1f;
-        [HideInInspector, SerializeField] private float boardingRewardWeight = 1f;
-        [HideInInspector, SerializeField] private float dropoffRewardWeight = 1f;
-        [HideInInspector, SerializeField] private float acceptableWaitSeconds = 100f;
-        [HideInInspector, SerializeField] private float acceptableWaitRewardMultiplier = 5f;
+        [Header("Reward")]
+        [SerializeField, Min(0f), InspectorName("Unboarded Penalty x")] private float unboardedPassengerPenaltyWeight = 1f;
+        [SerializeField, Min(0f), InspectorName("Boarding Reward x")] private float boardingRewardWeight = 1f;
+        [SerializeField, Min(0f), InspectorName("Dropoff Reward x")] private float dropoffRewardWeight = 1f;
+        [SerializeField, Min(0f), InspectorName("No Interaction Penalty x")] private float noInteractionPenaltyWeight = 2f;
+        [SerializeField, Min(1f), InspectorName("Accept Wait (s)")] private float acceptableWaitSeconds = 100f;
+        [SerializeField, Min(1f), InspectorName("Accept Wait x")] private float acceptableWaitRewardMultiplier = 1f;
         [HideInInspector, SerializeField] private float networkDistanceUnitsPerMinute = 100f;
         [HideInInspector, SerializeField] private float minimumNetworkAverageReward = 0.01f;
         [HideInInspector, SerializeField] private float invalidActionPenalty = 0f;
         [HideInInspector, SerializeField] private bool logReward = true;
 
-        [HideInInspector, SerializeField] private float waitingPassengerWeight = 3f;
-        [HideInInspector, SerializeField] private float onBoardDestinationWeight = 5f;
-        [HideInInspector, SerializeField] private float scheduledPassengerWeight = 0.5f;
-        [HideInInspector, SerializeField] private float distancePenaltyWeight = 0.002f;
         [HideInInspector, SerializeField] private bool logDecision = true;
         [HideInInspector, SerializeField] private bool logPolicyAction = true;
 
@@ -226,7 +224,7 @@ namespace DRT
 
             stopId = selectedStopId;
             decisionReady = false;
-            return stopId >= 1;
+            return true;
         }
 
         public void CancelDecision()
@@ -263,7 +261,8 @@ namespace DRT
             float unboardedPenalty = GetUnboardedPassengerPenalty(currentEpisodeTime);
             float boardingReward = GetBoardingReward(result.StopId, currentEpisodeTime, networkAverageReward);
             float dropoffReward = GetDropoffReward(result.StopId, currentEpisodeTime, networkAverageReward);
-            float reward = boardingReward + dropoffReward - unboardedPenalty;
+            float noInteractionPenalty = GetNoInteractionPenalty(result, networkAverageReward);
+            float reward = boardingReward + dropoffReward - unboardedPenalty - noInteractionPenalty;
 
             AddReward(reward);
             episodeRewardTotal += reward;
@@ -273,6 +272,7 @@ namespace DRT
             RecordStat("DRT/Reward/Boarding", boardingReward);
             RecordStat("DRT/Reward/Dropoff", dropoffReward);
             RecordStat("DRT/Reward/UnboardedPenalty", unboardedPenalty);
+            RecordStat("DRT/Reward/NoInteractionPenalty", noInteractionPenalty);
             RecordStat("DRT/Reward/EpisodeTotal", episodeRewardTotal, StatAggregationMethod.MostRecent);
             RecordStat("DRT/StopArrivals", 1f, StatAggregationMethod.Sum);
             RecordStat("DRT/EpisodeStopArrivalCount", episodeStopArrivalCount, StatAggregationMethod.MostRecent);
@@ -282,7 +282,8 @@ namespace DRT
                 Debug.Log(
                     $"[NEXTSTOPSELECTOR] PaperReward stop={result.StopId} t={currentEpisodeTime:0.0}s " +
                     $"reward={reward:0.000}, board={boardingReward:0.000}, drop={dropoffReward:0.000}, " +
-                    $"unboardedPenalty={unboardedPenalty:0.000}, networkAvg={networkAverageReward:0.000}");
+                    $"unboardedPenalty={unboardedPenalty:0.000}, noInteractionPenalty={noInteractionPenalty:0.000}, " +
+                    $"networkAvg={networkAverageReward:0.000}");
             }
         }
 
@@ -406,7 +407,6 @@ namespace DRT
             int actionIndex = actionBuffers.DiscreteActions.Length > 0 ? actionBuffers.DiscreteActions[0] : -1;
             int rawStopId = GetStopIdFromAction(actionIndex, false);
             selectedStopId = GetStopIdFromAction(actionIndex, true);
-            bool usedFallback = selectedStopId < 1;
 
             if (selectedStopId < 1)
             {
@@ -417,15 +417,9 @@ namespace DRT
                     RecordStat("DRT/Reward/InvalidActionPenalty", invalidActionPenalty);
                     RecordStat("DRT/Reward/EpisodeTotal", episodeRewardTotal, StatAggregationMethod.MostRecent);
                 }
-
-                selectedStopId = SelectNextStopId(
-                    decisionCurrentStopId,
-                    decisionStops,
-                    decisionPassengerManager,
-                    decisionEpisodeTime);
             }
 
-            LogPolicyAction(actionIndex, rawStopId, selectedStopId, usedFallback);
+            LogPolicyAction(actionIndex, rawStopId, selectedStopId);
             lastSelectedStopId = selectedStopId;
             decisionPending = false;
             decisionReady = true;
@@ -452,11 +446,8 @@ namespace DRT
             }
             else
             {
-                heuristicStopId = SelectNextStopId(
-                    decisionCurrentStopId,
-                    decisionStops,
-                    decisionPassengerManager,
-                    decisionEpisodeTime);
+                discreteActionsOut[0] = -1;
+                return;
             }
 
             discreteActionsOut[0] = FindActionIndexForStop(heuristicStopId);
@@ -516,141 +507,6 @@ namespace DRT
             return nextStopId;
         }
 
-        public int SelectNextStopId(
-            int currentStopId,
-            IReadOnlyList<DRTStop> stops,
-            DRTPassengerManager passengerManager,
-            float currentEpisodeTime)
-        {
-            if (stops == null || stops.Count == 0 || passengerManager == null)
-            {
-                return -1;
-            }
-
-            DRTStop currentStop = FindStop(stops, currentStopId);
-            int bestStopId = -1;
-            float bestScore = float.NegativeInfinity;
-            var scoreSummary = new StringBuilder();
-
-            for (int i = 0; i < stops.Count; i++)
-            {
-                var stop = stops[i];
-                if (stop == null)
-                {
-                    continue;
-                }
-
-                if (skipCurrentStop && stops.Count > 1 && stop.StopId == currentStopId)
-                {
-                    continue;
-                }
-
-                int waitingCount = passengerManager.GetWaitingCountAtStop(stop.StopId, currentEpisodeTime);
-                int dropOffCount = passengerManager.GetOnBoardDestinationCount(stop.StopId);
-                int scheduledCount = passengerManager.GetScheduledCountAtStop(stop.StopId, currentEpisodeTime);
-
-                float distancePenalty = 0f;
-                if (currentStop != null)
-                {
-                    distancePenalty = GetTravelPenaltyUnits(currentStop.StopId, stop.StopId, currentStop, stop) * distancePenaltyWeight;
-                }
-
-                float score =
-                    waitingCount * waitingPassengerWeight +
-                    dropOffCount * onBoardDestinationWeight +
-                    scheduledCount * scheduledPassengerWeight -
-                    distancePenalty;
-
-                if (scoreSummary.Length > 0)
-                {
-                    scoreSummary.Append("; ");
-                }
-
-                scoreSummary.Append("S")
-                    .Append(stop.StopId)
-                    .Append("(w=").Append(waitingCount)
-                    .Append(",drop=").Append(dropOffCount)
-                    .Append(",future=").Append(scheduledCount)
-                    .Append(",score=").Append(score.ToString("0.00"))
-                    .Append(")");
-
-                if (score > bestScore)
-                {
-                    bestScore = score;
-                    bestStopId = stop.StopId;
-                }
-            }
-
-            if (bestStopId >= 1 && bestScore > 0f)
-            {
-                LogSelectedStop("weighted-score", bestStopId, currentStopId, currentEpisodeTime, passengerManager, bestScore, scoreSummary.ToString());
-                return bestStopId;
-            }
-
-            if (TryGetNextScheduledOriginExcludingCurrent(
-                    currentStopId,
-                    stops,
-                    passengerManager,
-                    currentEpisodeTime,
-                    out int scheduledOriginStopId))
-            {
-                LogSelectedStop("next-scheduled-origin", scheduledOriginStopId, currentStopId, currentEpisodeTime, passengerManager, bestScore, scoreSummary.ToString());
-                return scheduledOriginStopId;
-            }
-
-            int sequentialStopId = GetNextSequentialStopId(currentStopId, stops);
-            LogSelectedStop("sequential-fallback", sequentialStopId, currentStopId, currentEpisodeTime, passengerManager, bestScore, scoreSummary.ToString());
-            return sequentialStopId;
-        }
-
-        private bool TryGetNextScheduledOriginExcludingCurrent(
-            int currentStopId,
-            IReadOnlyList<DRTStop> stops,
-            DRTPassengerManager passengerManager,
-            float currentEpisodeTime,
-            out int scheduledOriginStopId)
-        {
-            scheduledOriginStopId = -1;
-
-            if (passengerManager == null)
-            {
-                return false;
-            }
-
-            if (!passengerManager.TryGetNextScheduledOrigin(currentEpisodeTime, out int nextOriginStopId))
-            {
-                return false;
-            }
-
-            if (!skipCurrentStop || stops == null || stops.Count <= 1 || nextOriginStopId != currentStopId)
-            {
-                scheduledOriginStopId = nextOriginStopId;
-                return true;
-            }
-
-            float bestRequestTime = float.PositiveInfinity;
-            var requests = passengerManager.Requests;
-            for (int i = 0; i < requests.Count; i++)
-            {
-                var request = requests[i];
-                if (request == null ||
-                    request.Status != DRTPassengerStatus.Scheduled ||
-                    request.OriginStopId == currentStopId ||
-                    FindStop(stops, request.OriginStopId) == null)
-                {
-                    continue;
-                }
-
-                if (request.RequestTimeSeconds < bestRequestTime)
-                {
-                    bestRequestTime = request.RequestTimeSeconds;
-                    scheduledOriginStopId = request.OriginStopId;
-                }
-            }
-
-            return scheduledOriginStopId >= 1;
-        }
-
         private void LogSelectedStop(
             string reason,
             int selectedStopId,
@@ -701,7 +557,7 @@ namespace DRT
             return stop.StopId;
         }
 
-        private void LogPolicyAction(int actionIndex, int rawStopId, int finalStopId, bool usedFallback)
+        private void LogPolicyAction(int actionIndex, int rawStopId, int finalStopId)
         {
             if (!logPolicyAction || ShouldSuppressUnityLogs())
             {
@@ -718,7 +574,7 @@ namespace DRT
             Debug.Log(
                 $"[NEXTSTOPSELECTOR] PolicyAction t={decisionEpisodeTime:0.0}s current={decisionCurrentStopId} " +
                 $"rawAction={actionIndex}, rawStop={FormatStopId(rawStopId)}, selected={FormatStopId(finalStopId)}, " +
-                $"fallback={usedFallback}, waitingTotal={waitingTotal}, onBoard={onBoard}, " +
+                $"validAction={finalStopId >= 1}, waitingTotal={waitingTotal}, onBoard={onBoard}, " +
                 $"policy={GetPolicySummary()}, demand=[{BuildDecisionDemandSummary()}]");
         }
 
@@ -872,6 +728,18 @@ namespace DRT
             return reward;
         }
 
+        private float GetNoInteractionPenalty(DRTStopProcessResult result, float networkAverageReward)
+        {
+            if (noInteractionPenaltyWeight <= 0f ||
+                result.BoardedCount > 0 ||
+                result.DroppedOffCount > 0)
+            {
+                return 0f;
+            }
+
+            return noInteractionPenaltyWeight * networkAverageReward;
+        }
+
         private float GetNetworkAverageAccessReward()
         {
             int stopCount = decisionStops != null ? Mathf.Min(decisionStops.Count, maxStops) : 0;
@@ -944,22 +812,6 @@ namespace DRT
 
             float distance = Vector3.Distance(origin.Position, destination.Position);
             return Mathf.Clamp01(distance / Mathf.Max(1f, maxDistanceForObservation));
-        }
-
-        private float GetTravelPenaltyUnits(int fromStopId, int toStopId, DRTStop origin, DRTStop destination)
-        {
-            if (busController != null &&
-                busController.TryGetTravelTimeSeconds(fromStopId, toStopId, out float matrixSeconds))
-            {
-                return matrixSeconds;
-            }
-
-            if (origin == null || destination == null)
-            {
-                return 0f;
-            }
-
-            return Vector3.Distance(origin.Position, destination.Position);
         }
 
         private void GetStopPassengerTimeFeatures(int stopId, float currentEpisodeTime, out float maxWaitSeconds, out float maxRideSeconds)
@@ -1342,14 +1194,11 @@ namespace DRT
             unboardedPassengerPenaltyWeight = Mathf.Max(0f, unboardedPassengerPenaltyWeight);
             boardingRewardWeight = Mathf.Max(0f, boardingRewardWeight);
             dropoffRewardWeight = Mathf.Max(0f, dropoffRewardWeight);
+            noInteractionPenaltyWeight = Mathf.Max(0f, noInteractionPenaltyWeight);
             acceptableWaitSeconds = Mathf.Max(1f, acceptableWaitSeconds);
             acceptableWaitRewardMultiplier = Mathf.Max(1f, acceptableWaitRewardMultiplier);
             networkDistanceUnitsPerMinute = Mathf.Max(1f, networkDistanceUnitsPerMinute);
             minimumNetworkAverageReward = Mathf.Max(0.001f, minimumNetworkAverageReward);
-            waitingPassengerWeight = Mathf.Max(0f, waitingPassengerWeight);
-            onBoardDestinationWeight = Mathf.Max(0f, onBoardDestinationWeight);
-            scheduledPassengerWeight = Mathf.Max(0f, scheduledPassengerWeight);
-            distancePenaltyWeight = Mathf.Max(0f, distancePenaltyWeight);
             ConfigureBehaviorParameters();
         }
     }

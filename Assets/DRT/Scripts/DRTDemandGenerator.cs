@@ -6,56 +6,18 @@ using UnityEngine;
 
 namespace DRT
 {
-    public enum DRTDemandSource
-    {
-        CsvResourcePreset,
-        CsvTextAsset,
-        InspectorSchedule,
-        RuleBasedDefault
-    }
-
-    public enum DRTDemandCsvPreset
-    {
-        Scenario14Passengers,
-        Scenario18Passengers,
-        Scenario22Passengers,
-        Scenario30Passengers,
-        CustomResourceName
-    }
-
-    [Serializable]
-    public class DRTDemandScheduleEntry
-    {
-        [Min(0)] public int passengerId;
-        [Min(0f)] public float requestTimeSeconds;
-        [Min(1)] public int originStopId = 1;
-        [Min(1)] public int destinationStopId = 2;
-        [Min(1)] public int passengerCount = 1;
-        public DRTPassengerStatus initialStatus = DRTPassengerStatus.Scheduled;
-    }
-
     public class DRTDemandGenerator : MonoBehaviour
     {
-        private const string Scenario14ResourceName = "drt_scenario_14";
-        private const string Scenario18ResourceName = "drt_scenario_18";
-        private const string Scenario22ResourceName = "drt_scenario_22";
-        private const string Scenario30ResourceName = "drt_scenario_30";
-
         [HideInInspector, SerializeField] private DRTPassengerManager passengerManager;
 
         [Header("Scenario")]
         [HideInInspector, SerializeField] private bool generateOnStart;
         [HideInInspector, SerializeField] private bool clearExistingRequests = true;
-        [SerializeField, InspectorName("Source")] private DRTDemandSource demandSource = DRTDemandSource.CsvResourcePreset;
-        [SerializeField, InspectorName("CSV Preset")] private DRTDemandCsvPreset csvPreset = DRTDemandCsvPreset.Scenario14Passengers;
-        [SerializeField, InspectorName("CSV Asset")] private TextAsset scenarioCsvAsset;
-        [SerializeField, InspectorName("Custom Resource")] private string customScenarioResourceName = Scenario14ResourceName;
+        [SerializeField, InspectorName("Scenario CSV")] private TextAsset scenarioCsvAsset;
         [HideInInspector, SerializeField] private bool spawnRequestsAtRequestTime = true;
 
         [HideInInspector, SerializeField] private int stopCount = 8;
         [HideInInspector, SerializeField] private float episodeLengthSeconds = 3000f;
-        [HideInInspector, SerializeField, Range(6, 30)] private int defaultRequestCount = 14;
-        [HideInInspector, SerializeField] private List<DRTDemandScheduleEntry> demandSchedule = new List<DRTDemandScheduleEntry>();
 
         [HideInInspector, SerializeField] private bool logSpawnedRequests;
 
@@ -72,7 +34,7 @@ namespace DRT
         public string LoadedScenarioDescription => loadedScenarioDescription;
         public string ExportScenarioId => loadedPassengerCount > 0
             ? loadedPassengerCount.ToString(CultureInfo.InvariantCulture)
-            : defaultRequestCount.ToString(CultureInfo.InvariantCulture);
+            : "0";
 
         public void Configure(DRTPassengerManager newPassengerManager, int newStopCount)
         {
@@ -215,48 +177,14 @@ namespace DRT
             result = null;
             error = null;
 
-            switch (demandSource)
+            if (scenarioCsvAsset == null)
             {
-                case DRTDemandSource.CsvResourcePreset:
-                {
-                    string resourceName = GetSelectedScenarioResourceName();
-                    TextAsset csvAsset = Resources.Load<TextAsset>(resourceName);
-                    if (csvAsset == null)
-                    {
-                        error = $"CSV resource '{resourceName}' was not found under a Resources folder.";
-                        return false;
-                    }
-
-                    loadedScenarioDescription = $"resource:{resourceName}";
-                    return TryParseCsvSchedule(csvAsset.text, loadedScenarioDescription, suppressLog, out result, out error);
-                }
-
-                case DRTDemandSource.CsvTextAsset:
-                {
-                    if (scenarioCsvAsset == null)
-                    {
-                        error = "Scenario CSV TextAsset is not assigned.";
-                        return false;
-                    }
-
-                    loadedScenarioDescription = $"asset:{scenarioCsvAsset.name}";
-                    return TryParseCsvSchedule(scenarioCsvAsset.text, loadedScenarioDescription, suppressLog, out result, out error);
-                }
-
-                case DRTDemandSource.InspectorSchedule:
-                    loadedScenarioDescription = "inspector schedule";
-                    result = BuildInspectorSchedule();
-                    return true;
-
-                case DRTDemandSource.RuleBasedDefault:
-                    loadedScenarioDescription = $"rule-based:{defaultRequestCount}";
-                    result = BuildDefaultRuleBasedSchedule();
-                    return true;
-
-                default:
-                    error = $"Unsupported demand source: {demandSource}";
-                    return false;
+                error = "Scenario CSV TextAsset is not assigned.";
+                return false;
             }
+
+            loadedScenarioDescription = $"asset:{scenarioCsvAsset.name}";
+            return TryParseCsvSchedule(scenarioCsvAsset.text, loadedScenarioDescription, suppressLog, out result, out error);
         }
 
         private bool TryParseCsvSchedule(
@@ -360,63 +288,6 @@ namespace DRT
             }
 
             return true;
-        }
-
-        private List<DRTDemandReplayEntry> BuildInspectorSchedule()
-        {
-            var result = new List<DRTDemandReplayEntry>();
-            for (int i = 0; i < demandSchedule.Count; i++)
-            {
-                var entry = demandSchedule[i];
-                if (entry == null)
-                {
-                    continue;
-                }
-
-                result.Add(new DRTDemandReplayEntry
-                {
-                    passengerId = entry.passengerId,
-                    requestTimeSeconds = Mathf.Max(0f, entry.requestTimeSeconds),
-                    originStopId = entry.originStopId,
-                    destinationStopId = entry.destinationStopId,
-                    passengerCount = Mathf.Max(1, entry.passengerCount),
-                    initialStatus = NormalizeInitialStatus(entry.initialStatus),
-                    sourceDescription = $"inspector:{i + 1}"
-                });
-            }
-
-            return result;
-        }
-
-        private List<DRTDemandReplayEntry> BuildDefaultRuleBasedSchedule()
-        {
-            var result = new List<DRTDemandReplayEntry>();
-            int safeStopCount = Mathf.Max(2, stopCount);
-            int safeRequestCount = Mathf.Clamp(defaultRequestCount, 6, 30);
-            float interval = episodeLengthSeconds / safeRequestCount;
-
-            for (int i = 0; i < safeRequestCount; i++)
-            {
-                int origin = i % safeStopCount + 1;
-                int destination = (i * 3 + safeStopCount / 2) % safeStopCount + 1;
-                if (origin == destination)
-                {
-                    destination = destination % safeStopCount + 1;
-                }
-
-                result.Add(new DRTDemandReplayEntry
-                {
-                    passengerId = 0,
-                    requestTimeSeconds = Mathf.Round(i * interval),
-                    originStopId = origin,
-                    destinationStopId = destination,
-                    passengerCount = 1,
-                    initialStatus = DRTPassengerStatus.Scheduled,
-                    sourceDescription = $"rule:{i + 1}"
-                });
-            }
-
-            return result;
         }
 
         private void SpawnAllRequests(bool suppressLog)
@@ -546,47 +417,6 @@ namespace DRT
             var request = replaySchedule[0];
             string passengerId = request.passengerId > 0 ? request.passengerId.ToString(CultureInfo.InvariantCulture) : "auto";
             return $"#{passengerId}:{request.originStopId}->{request.destinationStopId}@{request.requestTimeSeconds:0}s";
-        }
-
-        private string GetSelectedScenarioResourceName()
-        {
-            switch (csvPreset)
-            {
-                case DRTDemandCsvPreset.Scenario18Passengers:
-                    return Scenario18ResourceName;
-                case DRTDemandCsvPreset.Scenario22Passengers:
-                    return Scenario22ResourceName;
-                case DRTDemandCsvPreset.Scenario30Passengers:
-                    return Scenario30ResourceName;
-                case DRTDemandCsvPreset.CustomResourceName:
-                    return NormalizeResourceName(customScenarioResourceName);
-                case DRTDemandCsvPreset.Scenario14Passengers:
-                default:
-                    return Scenario14ResourceName;
-            }
-        }
-
-        private static string NormalizeResourceName(string resourceName)
-        {
-            if (string.IsNullOrWhiteSpace(resourceName))
-            {
-                return Scenario14ResourceName;
-            }
-
-            string normalized = resourceName.Trim().Replace('\\', '/');
-            const string resourcesMarker = "Resources/";
-            int resourcesIndex = normalized.IndexOf(resourcesMarker, StringComparison.OrdinalIgnoreCase);
-            if (resourcesIndex >= 0)
-            {
-                normalized = normalized.Substring(resourcesIndex + resourcesMarker.Length);
-            }
-
-            if (normalized.EndsWith(".csv", StringComparison.OrdinalIgnoreCase))
-            {
-                normalized = normalized.Substring(0, normalized.Length - 4);
-            }
-
-            return normalized;
         }
 
         private static DRTPassengerStatus ReadInitialStatus(string[] fields, int statusColumn, int rowNumber, bool suppressLog)
@@ -788,7 +618,6 @@ namespace DRT
         {
             stopCount = Mathf.Max(2, stopCount);
             episodeLengthSeconds = Mathf.Max(1f, episodeLengthSeconds);
-            customScenarioResourceName = NormalizeResourceName(customScenarioResourceName);
         }
 
         private sealed class DRTDemandReplayEntry
