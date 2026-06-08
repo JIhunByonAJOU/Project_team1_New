@@ -25,6 +25,8 @@ namespace DRT.Editor
         private const string PhysicalDriveModeKey = "DRT_SMOKE_PHYSICAL_DRIVE_MODE";
         private const string PPODrivePolicyKey = "DRT_SMOKE_PPO_DRIVE_POLICY";
         private const string PolicyKey = "DRT_SMOKE_POLICY";
+        private const string PPOSpeedLimitEnabledKey = "DRT_SMOKE_PPO_SPEED_LIMIT_ENABLED";
+        private const string PPOSpeedLimitMetersPerSecondKey = "DRT_SMOKE_PPO_SPEED_LIMIT_MPS";
         private const string PPOTrainingRouteEnabledKey = "DRT_SMOKE_PPO_TRAINING_ROUTE_ENABLED";
         private const string PPOTrainingRouteStartStopKey = "DRT_SMOKE_PPO_TRAINING_ROUTE_START_STOP";
         private const string PPOTrainingRouteEndStopKey = "DRT_SMOKE_PPO_TRAINING_ROUTE_END_STOP";
@@ -210,6 +212,8 @@ namespace DRT.Editor
             SessionState.SetString(PhysicalDriveModeKey, string.Empty);
             SessionState.SetString(PPODrivePolicyKey, string.Empty);
             SessionState.SetString(PolicyKey, string.Empty);
+            SessionState.SetString(PPOSpeedLimitEnabledKey, string.Empty);
+            SessionState.SetString(PPOSpeedLimitMetersPerSecondKey, string.Empty);
             SessionState.SetString(PPOTrainingRouteEnabledKey, string.Empty);
             SessionState.SetString(PPOTrainingRouteStartStopKey, string.Empty);
             SessionState.SetString(PPOTrainingRouteEndStopKey, string.Empty);
@@ -257,6 +261,16 @@ namespace DRT.Editor
                 else if (key.Equals("nextStopPolicy", StringComparison.OrdinalIgnoreCase))
                 {
                     SessionState.SetString(PolicyKey, value);
+                }
+                else if (key.Equals("ppoSpeedLimitEnabled", StringComparison.OrdinalIgnoreCase) ||
+                         key.Equals("usePPOSpeedLimit", StringComparison.OrdinalIgnoreCase))
+                {
+                    SessionState.SetString(PPOSpeedLimitEnabledKey, value);
+                }
+                else if (key.Equals("ppoSpeedLimitMetersPerSecond", StringComparison.OrdinalIgnoreCase) ||
+                         key.Equals("ppoSpeedLimitMps", StringComparison.OrdinalIgnoreCase))
+                {
+                    SessionState.SetString(PPOSpeedLimitMetersPerSecondKey, value);
                 }
                 else if (key.Equals("ppoTrainingRouteEnabled", StringComparison.OrdinalIgnoreCase) ||
                          key.Equals("usePPOTrainingRouteEpisode", StringComparison.OrdinalIgnoreCase))
@@ -367,7 +381,8 @@ namespace DRT.Editor
                 $"[DRT_SMOKE] Applied runtime config. label={SessionState.GetString(LabelKey, "-")}, " +
                 $"mode={busController.TravelExecutionModeName}, physicalDriver={busController.PhysicalDriveModeName}, " +
                 $"ppoPolicy={busController.PPODrivePolicyName}, policy={nextStopSelector.NextStopPolicyName}, " +
-                $"ppoRoute={busController.PPOTrainingRouteName}");
+                $"ppoRoute={busController.PPOTrainingRouteName}, " +
+                $"ppoSpeedLimit={(busController.UsePPOSpeedLimit ? $"{busController.PPOSpeedLimitMetersPerSecond:0.00}m/s" : "off")}");
         }
 
         private static void ApplyConfig(
@@ -397,6 +412,18 @@ namespace DRT.Editor
             if (Enum.TryParse(policyText, true, out DRTNextStopPolicy policy))
             {
                 SetPrivateField(nextStopSelector, "nextStopPolicy", policy);
+            }
+
+            string ppoSpeedLimitEnabledText = SessionState.GetString(PPOSpeedLimitEnabledKey, string.Empty);
+            if (TryParseConfigBool(ppoSpeedLimitEnabledText, out bool ppoSpeedLimitEnabled))
+            {
+                SetPrivateField(busController, "usePPOSpeedLimit", ppoSpeedLimitEnabled);
+            }
+
+            string ppoSpeedLimitText = SessionState.GetString(PPOSpeedLimitMetersPerSecondKey, string.Empty);
+            if (float.TryParse(ppoSpeedLimitText, NumberStyles.Float, CultureInfo.InvariantCulture, out float ppoSpeedLimitMetersPerSecond))
+            {
+                SetPrivateField(busController, "ppoSpeedLimitMetersPerSecond", Mathf.Max(0.5f, ppoSpeedLimitMetersPerSecond));
             }
 
             string routeEnabledText = SessionState.GetString(PPOTrainingRouteEnabledKey, string.Empty);

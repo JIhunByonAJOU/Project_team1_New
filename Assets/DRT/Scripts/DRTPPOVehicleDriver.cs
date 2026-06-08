@@ -33,7 +33,8 @@ namespace DRT
         [SerializeField] private VehicleTypes vehicleType = VehicleTypes.Car;
         [SerializeField] private float speedMultiplier = 1f;
         [SerializeField] private float waypointReachDistanceMeters = 6f;
-        [SerializeField] private float finalReachDistanceMeters = 4f;
+        [SerializeField] private float finalReachDistanceMeters = 2.5f;
+        [SerializeField] private float destinationTailDistanceMeters = 12f;
 
         [Header("Policy")]
         [SerializeField, InspectorName("Mode")] private DRTPPODrivePolicy drivePolicy = DRTPPODrivePolicy.MLAgentsTraining;
@@ -42,18 +43,24 @@ namespace DRT
 
         [Header("Control")]
         [SerializeField] private float baseCruiseSpeedMetersPerSecond = 5f;
+        [SerializeField, InspectorName("Use Speed Limit")] private bool usePolicySpeedLimit = true;
         [SerializeField] private float maxPolicySpeedMetersPerSecond = 5f;
         [SerializeField] private float speedLimitBrakeInput = -0.45f;
         [HideInInspector, SerializeField] private bool endEpisodeOnDestinationReached = true;
         [SerializeField] private float maxObservationSpeedMetersPerSecond = 12f;
         [SerializeField] private float maxSteeringAngleForFullInput = 45f;
         [SerializeField] private float hardTurnAngle = 75f;
-        [SerializeField] private float slowDownDistanceMeters = 24f;
+        [SerializeField] private float slowDownDistanceMeters = 10f;
         [SerializeField] private float lookAheadTimeSeconds = 0.35f;
         [SerializeField] private float minLookAheadMeters = 4f;
         [SerializeField] private float maxLookAheadMeters = 16f;
         [SerializeField] private float steeringInputSmoothing = 8f;
         [SerializeField] private float throttleInputSmoothing = 6f;
+        [SerializeField] private float destinationApproachSpeedMetersPerSecond = 0.9f;
+        [SerializeField] private float destinationStopDistanceMultiplier = 2f;
+        [SerializeField] private float destinationApproachBrakeInput = -0.65f;
+        [SerializeField] private float destinationApproachCreepThrottle = 0.25f;
+        [SerializeField] private float destinationApproachRecoveryThrottle = 0.35f;
 
         [Header("Observation")]
         [SerializeField] private float maxObservationDistanceMeters = 80f;
@@ -90,7 +97,7 @@ namespace DRT
         [SerializeField] private float minimumProgressMeters = 0.4f;
         [SerializeField] private float hardCrossTrackLimitMeters = 10f;
         [SerializeField] private float reverseGraceSeconds = 2f;
-        [SerializeField] private float stopRuleDistanceMeters = 8f;
+        [SerializeField] private float stopRuleDistanceMeters = 4f;
         [SerializeField] private float stopRuleSpeedMetersPerSecond = 3f;
 
         private readonly List<int> pathWaypointIndexes = new List<int>();
@@ -219,6 +226,8 @@ namespace DRT
             currentThrottleInput = 0f;
             reverseSeconds = 0f;
             destinationReachedPending = false;
+            Vector3 bodyPosition = GetBodyPosition();
+            AddPathPoint(bodyPosition);
 
             if (waypointIndexes != null)
             {
@@ -236,9 +245,11 @@ namespace DRT
                 }
             }
 
+            Vector3 destinationTailPoint = GetDestinationTailPoint(destination, bodyPosition);
             AddPathPoint(destination);
+            AddPathPoint(destinationTailPoint);
+            targetPointIndex = pathPoints.Count > 1 ? 1 : 0;
             driving = pathPoints.Count > 0 && playerCar != null;
-            Vector3 bodyPosition = GetBodyPosition();
             lastWaypointDistance = GetCurrentWaypointDistance(bodyPosition);
             lastDestinationDistance = GetPlanarDistance(bodyPosition, finalDestination);
             bestDestinationDistance = lastDestinationDistance;
@@ -342,6 +353,12 @@ namespace DRT
         public void SetEndEpisodeOnDestinationReached(bool shouldEndEpisode)
         {
             endEpisodeOnDestinationReached = shouldEndEpisode;
+        }
+
+        public void ConfigureSpeedLimit(bool enabled, float speedLimitMetersPerSecond)
+        {
+            usePolicySpeedLimit = enabled;
+            maxPolicySpeedMetersPerSecond = Mathf.Max(0.5f, speedLimitMetersPerSecond);
         }
 
         public bool ConsumeDestinationReached()
@@ -584,6 +601,42 @@ namespace DRT
             pathPoints.Add(point);
         }
 
+        private Vector3 GetDestinationTailPoint(Vector3 destination, Vector3 bodyPosition)
+        {
+            Vector3 anchor = pathPoints.Count > 0 ? pathPoints[pathPoints.Count - 1] : destination;
+            Vector3 direction = Vector3.zero;
+            if (pathPoints.Count >= 2)
+            {
+                direction = pathPoints[pathPoints.Count - 1] - pathPoints[pathPoints.Count - 2];
+            }
+
+            if (direction.sqrMagnitude < 0.001f)
+            {
+                direction = destination - bodyPosition;
+            }
+
+            direction.y = 0f;
+            if (direction.sqrMagnitude < 0.001f)
+            {
+                direction = GetVehicleForward();
+                direction.y = 0f;
+            }
+
+            if (direction.sqrMagnitude < 0.001f)
+            {
+                direction = Vector3.forward;
+            }
+
+            direction.Normalize();
+            Vector3 toDestination = destination - anchor;
+            toDestination.y = 0f;
+            float destinationProjection = Mathf.Max(0f, Vector3.Dot(toDestination, direction));
+            float tailDistance = destinationProjection + Mathf.Max(0f, destinationTailDistanceMeters);
+            Vector3 tailPoint = anchor + direction * tailDistance;
+            tailPoint.y = destination.y;
+            return tailPoint;
+        }
+
         private void AddWaypointObservation(VectorSensor sensor, Vector3 bodyPosition, int pointIndex)
         {
             bool valid = pointIndex >= 0 && pointIndex < pathPoints.Count;
@@ -645,7 +698,51 @@ namespace DRT
                 currentThrottleInput = Mathf.Min(currentThrottleInput, speedLimitBrakeInput);
             }
 
+            currentThrottleInput = ShapeDestinationApproachThrottle(currentThrottleInput);
             playerCar.SetExternalInput(currentSteeringInput, currentThrottleInput, true);
+        }
+
+        private float ShapeDestinationApproachThrottle(float throttleInput)
+        {
+            if (!driving || pathPoints.Count == 0)
+            {
+                return throttleInput;
+            }
+
+            float finalDistance = GetPlanarDistance(GetBodyPosition(), finalDestination);
+            if (finalDistance > slowDownDistanceMeters)
+            {
+                return throttleInput;
+            }
+
+            float forwardSpeed = InverseVehicleDirection(GetVelocity()).z;
+            if (forwardSpeed < -0.05f)
+            {
+                return destinationApproachRecoveryThrottle;
+            }
+
+            float distanceRatio = Mathf.Clamp01(
+                (finalDistance - finalReachDistanceMeters) /
+                Mathf.Max(0.1f, slowDownDistanceMeters - finalReachDistanceMeters));
+            float stopDistance = finalReachDistanceMeters * Mathf.Max(1f, destinationStopDistanceMultiplier);
+            float stopRatio = Mathf.Clamp01((finalDistance - finalReachDistanceMeters) / Mathf.Max(0.1f, stopDistance - finalReachDistanceMeters));
+            float stopLimitedSpeed = destinationApproachSpeedMetersPerSecond * stopRatio;
+            float targetApproachSpeed = Mathf.Lerp(
+                stopLimitedSpeed,
+                Mathf.Max(destinationApproachSpeedMetersPerSecond, 1.5f),
+                distanceRatio);
+
+            if (forwardSpeed > targetApproachSpeed + 0.35f)
+            {
+                return Mathf.Min(throttleInput, destinationApproachBrakeInput);
+            }
+
+            if (targetApproachSpeed > 0.05f && forwardSpeed < targetApproachSpeed)
+            {
+                return Mathf.Max(throttleInput, destinationApproachCreepThrottle);
+            }
+
+            return Mathf.Max(throttleInput, 0f);
         }
 
         private void AdvancePathProgress()
@@ -937,6 +1034,11 @@ namespace DRT
 
         private float GetPolicySpeedLimit()
         {
+            if (!usePolicySpeedLimit)
+            {
+                return 0f;
+            }
+
             return maxPolicySpeedMetersPerSecond > 0f
                 ? maxPolicySpeedMetersPerSecond
                 : baseCruiseSpeedMetersPerSecond * Mathf.Max(0.1f, speedMultiplier);
@@ -1385,6 +1487,7 @@ namespace DRT
             speedMultiplier = Mathf.Max(0.1f, speedMultiplier);
             waypointReachDistanceMeters = Mathf.Max(0.5f, waypointReachDistanceMeters);
             finalReachDistanceMeters = Mathf.Max(0.25f, finalReachDistanceMeters);
+            destinationTailDistanceMeters = Mathf.Max(0f, destinationTailDistanceMeters);
             baseCruiseSpeedMetersPerSecond = Mathf.Max(0.5f, baseCruiseSpeedMetersPerSecond);
             maxPolicySpeedMetersPerSecond = Mathf.Max(0f, maxPolicySpeedMetersPerSecond);
             speedLimitBrakeInput = Mathf.Clamp(speedLimitBrakeInput, -1f, 0f);
@@ -1397,6 +1500,11 @@ namespace DRT
             maxLookAheadMeters = Mathf.Max(minLookAheadMeters, maxLookAheadMeters);
             steeringInputSmoothing = Mathf.Max(0.1f, steeringInputSmoothing);
             throttleInputSmoothing = Mathf.Max(0.1f, throttleInputSmoothing);
+            destinationApproachSpeedMetersPerSecond = Mathf.Max(0.1f, destinationApproachSpeedMetersPerSecond);
+            destinationStopDistanceMultiplier = Mathf.Max(1f, destinationStopDistanceMultiplier);
+            destinationApproachBrakeInput = Mathf.Clamp(destinationApproachBrakeInput, -1f, 0f);
+            destinationApproachCreepThrottle = Mathf.Clamp01(destinationApproachCreepThrottle);
+            destinationApproachRecoveryThrottle = Mathf.Clamp01(destinationApproachRecoveryThrottle);
             maxObservationDistanceMeters = Mathf.Max(1f, maxObservationDistanceMeters);
             maxCrossTrackErrorMeters = Mathf.Max(0.1f, maxCrossTrackErrorMeters);
             maxRoadWaypointDistanceMeters = Mathf.Max(0f, maxRoadWaypointDistanceMeters);

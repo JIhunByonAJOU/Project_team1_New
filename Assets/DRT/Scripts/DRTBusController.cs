@@ -37,7 +37,7 @@ namespace DRT
         [SerializeField, InspectorName("Start Stop")] private int startStopId = 1;
         [SerializeField, InspectorName("Vehicle Type")] private VehicleTypes controlledVehicleType = VehicleTypes.Car;
         [SerializeField, InspectorName("Dwell (s)")] private float dwellSeconds = 5f;
-        [SerializeField, InspectorName("Arrival Dist")] private float arrivalDistanceMeters = 5f;
+        [SerializeField, InspectorName("Arrival Dist")] private float arrivalDistanceMeters = 3f;
         [HideInInspector, SerializeField] private float stopWaypointSnapDistanceMeters = 5f;
         [HideInInspector, SerializeField] private float arrivalWaitTimeoutSeconds = 12f;
         [SerializeField, InspectorName("Speed x")] private float controlledVehicleSpeedMultiplier = 1.5f;
@@ -51,6 +51,8 @@ namespace DRT
         [Tooltip("Used only when Physical Driver is PPO Autonomous and PPO Policy is ONNX Inference.")]
         [SerializeField, InspectorName("PPO ONNX Model")] private NNModel ppoOnnxInferenceModel;
         [HideInInspector, SerializeField] private InferenceDevice ppoOnnxInferenceDevice = InferenceDevice.Default;
+        [SerializeField, InspectorName("Use PPO Speed Limit")] private bool usePPOSpeedLimit = true;
+        [SerializeField, InspectorName("PPO Speed Limit (m/s)")] private float ppoSpeedLimitMetersPerSecond = 5f;
 
         [Header("Travel Execution")]
         [Tooltip("Controls how the selected next stop is reached. Matrix Teleport uses the travel-time matrix; Physical Drive uses the configured vehicle driver.")]
@@ -182,6 +184,8 @@ namespace DRT
         public string PhysicalDriveModeName => physicalDriveMode.ToString();
         public DRTPPODrivePolicy PPODrivePolicy => ppoDrivePolicy;
         public string PPODrivePolicyName => ppoDrivePolicy.ToString();
+        public bool UsePPOSpeedLimit => usePPOSpeedLimit;
+        public float PPOSpeedLimitMetersPerSecond => ppoSpeedLimitMetersPerSecond;
         public DRTNextStopPolicy NextStopPolicy => nextStopSelector != null ? nextStopSelector.NextStopPolicy : DRTNextStopPolicy.MLAgentsTraining;
         public string NextStopPolicyName => nextStopSelector != null ? nextStopSelector.NextStopPolicyName : "-";
         public bool UsesMatrixTeleport => travelExecutionMode == DRTTravelExecutionMode.MatrixTeleport;
@@ -838,6 +842,7 @@ namespace DRT
                 ppoDrivePolicy,
                 ppoOnnxInferenceModel,
                 ppoOnnxInferenceDevice);
+            ppoVehicleDriver.ConfigureSpeedLimit(usePPOSpeedLimit, ppoSpeedLimitMetersPerSecond);
 
             var collisionRelay = controlledPlayerVehicle.GetComponent<DRTPPOVehicleCollisionRelay>();
             if (collisionRelay == null)
@@ -1673,7 +1678,6 @@ namespace DRT
         private bool IsPPOTrainingRouteEpisodeActive()
         {
             return usePPOTrainingRouteEpisode &&
-                   UsesPPOVehicleControl &&
                    ppoTrainingRouteStartStopId > 0 &&
                    ppoTrainingRouteEndStopId > 0 &&
                    ppoTrainingRouteStartStopId != ppoTrainingRouteEndStopId;
@@ -1787,14 +1791,18 @@ namespace DRT
 
         private void ConfigurePPOVehicleDestinationEpisodeEnd(int nextStopId)
         {
-            if (!UsesPPOVehicleControl || ppoVehicleDriver == null)
+            DRTPPOVehicleDriver activePPOVehicleDriver = vehicleDriver as DRTPPOVehicleDriver ?? ppoVehicleDriver;
+            if (activePPOVehicleDriver == null)
             {
                 return;
             }
 
             bool shouldEndEpisode = !IsPPOTrainingRouteEpisodeActive() ||
                                     nextStopId == ppoTrainingRouteEndStopId;
-            ppoVehicleDriver.SetEndEpisodeOnDestinationReached(shouldEndEpisode);
+            activePPOVehicleDriver.SetEndEpisodeOnDestinationReached(shouldEndEpisode);
+            LogInfo(
+                $"[BUSCONTROLLER] PPO leg episode-end configured. " +
+                $"targetStop={nextStopId}, endOnDestination={shouldEndEpisode}, route={PPOTrainingRouteName}");
         }
 
         private void BeginRouteLeg(int nextStopId, int pathWaypointCount, float plannedPathDistanceMeters)
@@ -2424,7 +2432,8 @@ namespace DRT
 
         private bool TryConsumeVehicleDestinationReached()
         {
-            return ppoVehicleDriver != null && ppoVehicleDriver.ConsumeDestinationReached();
+            DRTPPOVehicleDriver activePPOVehicleDriver = vehicleDriver as DRTPPOVehicleDriver ?? ppoVehicleDriver;
+            return activePPOVehicleDriver != null && activePPOVehicleDriver.ConsumeDestinationReached();
         }
 
         private bool IsTooFarFromTrafficWaypoint(Vector3 position, out float waypointDistance)
@@ -3292,6 +3301,8 @@ namespace DRT
             AppendEpisodeRow(builder, "summary", "travel_execution_mode", TravelExecutionModeName);
             AppendEpisodeRow(builder, "summary", "physical_drive_mode", PhysicalDriveModeName);
             AppendEpisodeRow(builder, "summary", "ppo_drive_policy", PPODrivePolicyName);
+            AppendEpisodeRow(builder, "summary", "ppo_speed_limit_enabled", usePPOSpeedLimit ? "1" : "0");
+            AppendEpisodeRow(builder, "summary", "ppo_speed_limit_mps", FormatCsvFloat(ppoSpeedLimitMetersPerSecond));
             AppendEpisodeRow(builder, "summary", "ppo_training_route_enabled", UsesPPOTrainingRouteEpisode ? "1" : "0");
             AppendEpisodeRow(builder, "summary", "ppo_training_route_start_stop_id", ppoTrainingRouteStartStopId.ToString(CultureInfo.InvariantCulture));
             AppendEpisodeRow(builder, "summary", "ppo_training_route_end_stop_id", ppoTrainingRouteEndStopId.ToString(CultureInfo.InvariantCulture));
@@ -3585,6 +3596,7 @@ namespace DRT
             gleyControlledVehicleSpeedMultiplier = Mathf.Clamp(gleyControlledVehicleSpeedMultiplier, 0.1f, 2f);
             playerWaypointReachDistanceMeters = Mathf.Max(0.5f, playerWaypointReachDistanceMeters);
             useGleyVehicleControlInPhysicalDrive = physicalDriveMode == DRTPhysicalDriveMode.Gley;
+            ppoSpeedLimitMetersPerSecond = Mathf.Max(0.5f, ppoSpeedLimitMetersPerSecond);
             vehicleTraceSampleIntervalSeconds = Mathf.Max(0.1f, vehicleTraceSampleIntervalSeconds);
             matrixNominalSpeedMetersPerSecond = Mathf.Max(0.1f, matrixNominalSpeedMetersPerSecond);
             enabledTrafficDensity = Mathf.Max(1, enabledTrafficDensity);
