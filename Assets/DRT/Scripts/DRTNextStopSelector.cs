@@ -31,11 +31,13 @@ namespace DRT
         [SerializeField, InspectorName("ONNX Model")] private NNModel onnxInferenceModel;
         [HideInInspector, SerializeField] private InferenceDevice onnxInferenceDevice = InferenceDevice.Default;
 
-        [HideInInspector, SerializeField] private float unboardedPassengerPenaltyWeight = 1f;
-        [HideInInspector, SerializeField] private float boardingRewardWeight = 1f;
-        [HideInInspector, SerializeField] private float dropoffRewardWeight = 1f;
-        [HideInInspector, SerializeField] private float acceptableWaitSeconds = 100f;
-        [HideInInspector, SerializeField] private float acceptableWaitRewardMultiplier = 1f;
+        [Header("Reward")]
+        [SerializeField, Min(0f), InspectorName("Unboarded Penalty x")] private float unboardedPassengerPenaltyWeight = 1f;
+        [SerializeField, Min(0f), InspectorName("Boarding Reward x")] private float boardingRewardWeight = 1f;
+        [SerializeField, Min(0f), InspectorName("Dropoff Reward x")] private float dropoffRewardWeight = 1f;
+        [SerializeField, Min(0f), InspectorName("No Interaction Penalty x")] private float noInteractionPenaltyWeight = 2f;
+        [SerializeField, Min(1f), InspectorName("Accept Wait (s)")] private float acceptableWaitSeconds = 100f;
+        [SerializeField, Min(1f), InspectorName("Accept Wait x")] private float acceptableWaitRewardMultiplier = 1f;
         [HideInInspector, SerializeField] private float networkDistanceUnitsPerMinute = 100f;
         [HideInInspector, SerializeField] private float minimumNetworkAverageReward = 0.01f;
         [HideInInspector, SerializeField] private float invalidActionPenalty = 0f;
@@ -259,7 +261,8 @@ namespace DRT
             float unboardedPenalty = GetUnboardedPassengerPenalty(currentEpisodeTime);
             float boardingReward = GetBoardingReward(result.StopId, currentEpisodeTime, networkAverageReward);
             float dropoffReward = GetDropoffReward(result.StopId, currentEpisodeTime, networkAverageReward);
-            float reward = boardingReward + dropoffReward - unboardedPenalty;
+            float noInteractionPenalty = GetNoInteractionPenalty(result, networkAverageReward);
+            float reward = boardingReward + dropoffReward - unboardedPenalty - noInteractionPenalty;
 
             AddReward(reward);
             episodeRewardTotal += reward;
@@ -269,6 +272,7 @@ namespace DRT
             RecordStat("DRT/Reward/Boarding", boardingReward);
             RecordStat("DRT/Reward/Dropoff", dropoffReward);
             RecordStat("DRT/Reward/UnboardedPenalty", unboardedPenalty);
+            RecordStat("DRT/Reward/NoInteractionPenalty", noInteractionPenalty);
             RecordStat("DRT/Reward/EpisodeTotal", episodeRewardTotal, StatAggregationMethod.MostRecent);
             RecordStat("DRT/StopArrivals", 1f, StatAggregationMethod.Sum);
             RecordStat("DRT/EpisodeStopArrivalCount", episodeStopArrivalCount, StatAggregationMethod.MostRecent);
@@ -278,7 +282,8 @@ namespace DRT
                 Debug.Log(
                     $"[NEXTSTOPSELECTOR] PaperReward stop={result.StopId} t={currentEpisodeTime:0.0}s " +
                     $"reward={reward:0.000}, board={boardingReward:0.000}, drop={dropoffReward:0.000}, " +
-                    $"unboardedPenalty={unboardedPenalty:0.000}, networkAvg={networkAverageReward:0.000}");
+                    $"unboardedPenalty={unboardedPenalty:0.000}, noInteractionPenalty={noInteractionPenalty:0.000}, " +
+                    $"networkAvg={networkAverageReward:0.000}");
             }
         }
 
@@ -721,6 +726,18 @@ namespace DRT
             }
 
             return reward;
+        }
+
+        private float GetNoInteractionPenalty(DRTStopProcessResult result, float networkAverageReward)
+        {
+            if (noInteractionPenaltyWeight <= 0f ||
+                result.BoardedCount > 0 ||
+                result.DroppedOffCount > 0)
+            {
+                return 0f;
+            }
+
+            return noInteractionPenaltyWeight * networkAverageReward;
         }
 
         private float GetNetworkAverageAccessReward()
@@ -1177,6 +1194,7 @@ namespace DRT
             unboardedPassengerPenaltyWeight = Mathf.Max(0f, unboardedPassengerPenaltyWeight);
             boardingRewardWeight = Mathf.Max(0f, boardingRewardWeight);
             dropoffRewardWeight = Mathf.Max(0f, dropoffRewardWeight);
+            noInteractionPenaltyWeight = Mathf.Max(0f, noInteractionPenaltyWeight);
             acceptableWaitSeconds = Mathf.Max(1f, acceptableWaitSeconds);
             acceptableWaitRewardMultiplier = Mathf.Max(1f, acceptableWaitRewardMultiplier);
             networkDistanceUnitsPerMinute = Mathf.Max(1f, networkDistanceUnitsPerMinute);
