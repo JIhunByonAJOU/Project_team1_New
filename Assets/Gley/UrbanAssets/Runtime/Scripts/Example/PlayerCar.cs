@@ -27,6 +27,7 @@ namespace Gley.UrbanSystem
         public List<AxleInfo> axleInfos;
         public Transform centerOfMass;
         public float maxMotorTorque;
+        public float maxBrakeTorque = 1200f;
         public float maxSteeringAngle;
         IVehicleLightsComponent lightsComponent;
         bool mainLights;
@@ -52,7 +53,7 @@ namespace Gley.UrbanSystem
             inputScript = gameObject.AddComponent<UIInputNew>().Initialize();
 #endif
             lightsComponent = gameObject.GetComponent<VehicleLightsComponent>();
-            lightsComponent.Initialize();
+            lightsComponent?.Initialize();
             rb = GetComponent<Rigidbody>();
         }
 
@@ -99,6 +100,7 @@ namespace Gley.UrbanSystem
                 : inputScript != null ? inputScript.GetHorizontalInput() : 0f;
 
             float motor = maxMotorTorque * verticalInput;
+            float brakeTorque = 0f;
             float steering = maxSteeringAngle * horizontalInput;
 #if UNITY_6000_0_OR_NEWER
             var velocity = rb.linearVelocity;
@@ -108,12 +110,20 @@ namespace Gley.UrbanSystem
             float localVelocity = transform.InverseTransformDirection(velocity).z + 0.1f;
             reverse = false;
             brake = false;
+
+            if (externalInputEnabled && verticalInput < 0f)
+            {
+                motor = 0f;
+                brakeTorque = -verticalInput * Mathf.Max(0f, maxBrakeTorque);
+                brake = true;
+            }
+
             if (localVelocity < 0)
             {
                 reverse = true;
             }
 
-            if (motor < 0)
+            if (!externalInputEnabled && motor < 0)
             {
                 if (localVelocity > 0)
                 {
@@ -143,6 +153,8 @@ namespace Gley.UrbanSystem
                     axleInfo.leftWheel.motorTorque = motor;
                     axleInfo.rightWheel.motorTorque = motor;
                 }
+                axleInfo.leftWheel.brakeTorque = brakeTorque;
+                axleInfo.rightWheel.brakeTorque = brakeTorque;
                 ApplyLocalPositionToVisuals(axleInfo.leftWheel);
                 ApplyLocalPositionToVisuals(axleInfo.rightWheel);
             }
@@ -151,6 +163,11 @@ namespace Gley.UrbanSystem
         private void Update()
         {
             realtimeSinceStartup += Time.deltaTime;
+            if (lightsComponent == null)
+            {
+                return;
+            }
+
             if (GetKeyDownSpace())
             {
                 mainLights = !mainLights;

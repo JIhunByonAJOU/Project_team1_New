@@ -119,6 +119,7 @@ namespace DRT
             GUILayout.Label($"Route: Stop {busController.CurrentStopId} -> Stop {busController.TargetStopId}", smallStyle);
             GUILayout.Label($"Mode {busController.TravelExecutionModeName}/{busController.PhysicalDriveModeName} | PPO {busController.PPODrivePolicyName} | Policy {busController.NextStopPolicyName} | Driver {busController.ControlledDriverName} | Vehicle {busController.ControlledVehicleName} | last served stop {busController.CurrentStopId}", smallStyle);
             GUILayout.Label($"PPO route episode: {busController.PPOTrainingRouteName}", smallStyle);
+            GUILayout.Label($"PPO speed limit: {(busController.UsePPOSpeedLimit ? $"{busController.PPOSpeedLimitMetersPerSecond:0.00}m/s" : "off")}", smallStyle);
             GUILayout.Label($"speed={busController.VehicleSpeedMS:0.00}m/s, targetDist={FormatDistance(busController.TargetDistanceMeters)}, arrival<= {busController.ArrivalDistanceMeters:0.00}m, waitingArrival={busController.IsWaitingForArrivalProximity}", smallStyle);
             GUILayout.Label($"blocked={busController.IsVehicleTemporarilyBlocked} {busController.TemporaryBlockReason}", smallStyle);
             GUILayout.Label($"episodeDistance={busController.EpisodeTravelDistanceMeters:0.0}m, assignedPath={busController.AssignedPathDistanceMeters:0.0}m/{busController.AssignedPathPointCount}pts", smallStyle);
