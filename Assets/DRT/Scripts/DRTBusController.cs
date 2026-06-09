@@ -1393,16 +1393,29 @@ namespace DRT
             }
             else
             {
-                nextStopId = nextStopSelector.UsesAllStationRunner
-                    ? nextStopSelector.SelectAllStationRunnerStopId(
-                        currentStopId,
-                        stops,
-                        episodeTimeSeconds)
-                    : nextStopSelector.SelectVanillaSequentialStopId(
-                        currentStopId,
-                        stops,
-                        passengerManager,
-                        episodeTimeSeconds);
+                switch (NextStopPolicy)
+                {
+                    case DRTNextStopPolicy.AllStationRunner:
+                        nextStopId = nextStopSelector.SelectAllStationRunnerStopId(
+                            currentStopId,
+                            stops,
+                            episodeTimeSeconds);
+                        break;
+                    case DRTNextStopPolicy.GreedyNearestFeasible:
+                        nextStopId = nextStopSelector.SelectGreedyNearestFeasibleStopId(
+                            currentStopId,
+                            stops,
+                            passengerManager,
+                            episodeTimeSeconds);
+                        break;
+                    default:
+                        nextStopId = nextStopSelector.SelectVanillaSequentialStopId(
+                            currentStopId,
+                            stops,
+                            passengerManager,
+                            episodeTimeSeconds);
+                        break;
+                }
             }
 
             if (stops.Count > 1 && nextStopId == currentStopId)
@@ -3263,6 +3276,8 @@ namespace DRT
                     return "inference";
                 case DRTNextStopPolicy.VanillaSequential:
                     return "vanilla";
+                case DRTNextStopPolicy.GreedyNearestFeasible:
+                    return "greedy";
                 case DRTNextStopPolicy.AllStationRunner:
                     return "all_station";
                 default:

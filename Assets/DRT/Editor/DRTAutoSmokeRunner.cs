@@ -1023,6 +1023,8 @@ namespace DRT.Editor
                         return "inference";
                     case DRTNextStopPolicy.VanillaSequential:
                         return "vanilla";
+                    case DRTNextStopPolicy.GreedyNearestFeasible:
+                        return "greedy";
                     case DRTNextStopPolicy.AllStationRunner:
                         return "all_station";
                 }

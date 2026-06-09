@@ -44,6 +44,9 @@ namespace DRT
         VanillaSequential,
 
         [InspectorName("All Station Runner")]
-        AllStationRunner
+        AllStationRunner,
+
+        [InspectorName("Greedy 1 - Nearest Feasible")]
+        GreedyNearestFeasible
     }
 }

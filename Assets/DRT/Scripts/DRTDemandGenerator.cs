@@ -6,6 +6,12 @@ using UnityEngine;
 
 namespace DRT
 {
+    public enum DRTDemandScenarioSelectionMode
+    {
+        FixedScenarioCsv,
+        RandomPerEpisode
+    }
+
     public class DRTDemandGenerator : MonoBehaviour
     {
         [HideInInspector, SerializeField] private DRTPassengerManager passengerManager;
@@ -13,7 +19,9 @@ namespace DRT
         [Header("Scenario")]
         [HideInInspector, SerializeField] private bool generateOnStart;
         [HideInInspector, SerializeField] private bool clearExistingRequests = true;
-        [SerializeField, InspectorName("Scenario CSV")] private TextAsset scenarioCsvAsset;
+        [SerializeField, InspectorName("Scenario Selection Mode")] private DRTDemandScenarioSelectionMode scenarioSelectionMode = DRTDemandScenarioSelectionMode.FixedScenarioCsv;
+        [SerializeField, InspectorName("Fixed Scenario CSV")] private TextAsset scenarioCsvAsset;
+        [SerializeField, InspectorName("Random Scenario CSVs")] private List<TextAsset> randomScenarioCsvAssets = new List<TextAsset>();
         [HideInInspector, SerializeField] private bool spawnRequestsAtRequestTime = true;
 
         [HideInInspector, SerializeField] private int stopCount = 8;
@@ -177,14 +185,49 @@ namespace DRT
             result = null;
             error = null;
 
-            if (scenarioCsvAsset == null)
+            TextAsset selectedScenario = SelectScenarioCsvAsset(out error);
+            if (selectedScenario == null)
             {
-                error = "Scenario CSV TextAsset is not assigned.";
                 return false;
             }
 
-            loadedScenarioDescription = $"asset:{scenarioCsvAsset.name}";
-            return TryParseCsvSchedule(scenarioCsvAsset.text, loadedScenarioDescription, suppressLog, out result, out error);
+            loadedScenarioDescription = $"asset:{selectedScenario.name}";
+            return TryParseCsvSchedule(selectedScenario.text, loadedScenarioDescription, suppressLog, out result, out error);
+        }
+
+        private TextAsset SelectScenarioCsvAsset(out string error)
+        {
+            error = null;
+            if (scenarioSelectionMode == DRTDemandScenarioSelectionMode.FixedScenarioCsv)
+            {
+                if (scenarioCsvAsset != null)
+                {
+                    return scenarioCsvAsset;
+                }
+
+                error = "Fixed Scenario CSV TextAsset is not assigned.";
+                return null;
+            }
+
+            var candidates = new List<TextAsset>();
+            if (randomScenarioCsvAssets != null)
+            {
+                for (int i = 0; i < randomScenarioCsvAssets.Count; i++)
+                {
+                    if (randomScenarioCsvAssets[i] != null)
+                    {
+                        candidates.Add(randomScenarioCsvAssets[i]);
+                    }
+                }
+            }
+
+            if (candidates.Count == 0)
+            {
+                error = "Random Scenario CSVs list has no assigned TextAssets.";
+                return null;
+            }
+
+            return candidates[UnityEngine.Random.Range(0, candidates.Count)];
         }
 
         private bool TryParseCsvSchedule(

@@ -72,7 +72,9 @@ namespace DRT
         public bool UsesMlAgentsDecisionPolicy =>
             !BypassMlAgentsDuringDriveTraining &&
             nextStopPolicy != DRTNextStopPolicy.VanillaSequential &&
+            nextStopPolicy != DRTNextStopPolicy.GreedyNearestFeasible &&
             nextStopPolicy != DRTNextStopPolicy.AllStationRunner;
+        public bool UsesGreedyNearestFeasible => nextStopPolicy == DRTNextStopPolicy.GreedyNearestFeasible;
         public bool UsesAllStationRunner => nextStopPolicy == DRTNextStopPolicy.AllStationRunner;
         public bool IsAllStationRunComplete => UsesAllStationRunner && allStationRunComplete;
 
@@ -444,6 +446,14 @@ namespace DRT
                     decisionPassengerManager,
                     decisionEpisodeTime);
             }
+            else if (nextStopPolicy == DRTNextStopPolicy.GreedyNearestFeasible)
+            {
+                heuristicStopId = SelectGreedyNearestFeasibleStopId(
+                    decisionCurrentStopId,
+                    decisionStops,
+                    decisionPassengerManager,
+                    decisionEpisodeTime);
+            }
             else
             {
                 discreteActionsOut[0] = -1;
@@ -470,6 +480,144 @@ namespace DRT
                 0f,
                 "fixed stop-id loop");
             return sequentialStopId;
+        }
+
+        public int SelectGreedyNearestFeasibleStopId(
+            int currentStopId,
+            IReadOnlyList<DRTStop> stops,
+            DRTPassengerManager passengerManager,
+            float currentEpisodeTime)
+        {
+            if (stops == null || stops.Count == 0 || passengerManager == null)
+            {
+                return SelectVanillaSequentialStopId(
+                    currentStopId,
+                    stops,
+                    passengerManager,
+                    currentEpisodeTime);
+            }
+
+            DRTStop currentStop = FindStop(stops, currentStopId);
+            int currentOnBoard = passengerManager.GetOnBoardCount();
+            int freeSeats = Mathf.Max(0, passengerManager.BusCapacity - currentOnBoard);
+            int bestStopId = -1;
+            float bestTravelSeconds = float.MaxValue;
+            int bestDropOffCount = 0;
+            int bestInteractionCount = 0;
+            float bestOldestWaitSeconds = -1f;
+            var scoreSummary = new StringBuilder();
+
+            for (int i = 0; i < stops.Count; i++)
+            {
+                DRTStop candidateStop = stops[i];
+                if (candidateStop == null)
+                {
+                    continue;
+                }
+
+                int candidateStopId = candidateStop.StopId;
+                if (skipCurrentStop && stops.Count > 1 && candidateStopId == currentStopId)
+                {
+                    continue;
+                }
+
+                int dropOffCount = passengerManager.GetOnBoardDestinationCount(candidateStopId);
+                int waitingCount = passengerManager.GetWaitingCountAtStop(candidateStopId, currentEpisodeTime);
+                int boardableCount = Mathf.Min(waitingCount, freeSeats + dropOffCount);
+                int interactionCount = dropOffCount + boardableCount;
+                if (interactionCount <= 0)
+                {
+                    continue;
+                }
+
+                float travelSeconds = GetCandidateTravelSeconds(
+                    currentStopId,
+                    candidateStopId,
+                    currentStop,
+                    candidateStop);
+                float oldestWaitSeconds = GetOldestWaitingSecondsAtStop(
+                    passengerManager,
+                    candidateStopId,
+                    currentEpisodeTime);
+
+                if (scoreSummary.Length > 0)
+                {
+                    scoreSummary.Append("; ");
+                }
+
+                scoreSummary
+                    .Append("S").Append(candidateStopId)
+                    .Append("(travel=").Append(travelSeconds.ToString("0.0"))
+                    .Append("s,drop=").Append(dropOffCount)
+                    .Append(",board=").Append(boardableCount)
+                    .Append(",oldestWait=").Append(oldestWaitSeconds.ToString("0.0"))
+                    .Append("s)");
+
+                bool shouldSelect = bestStopId < 1 ||
+                                    travelSeconds < bestTravelSeconds - 0.001f;
+
+                if (!shouldSelect && Mathf.Abs(travelSeconds - bestTravelSeconds) <= 0.001f)
+                {
+                    bool candidateHasDropOff = dropOffCount > 0;
+                    bool bestHasDropOff = bestDropOffCount > 0;
+                    shouldSelect = candidateHasDropOff != bestHasDropOff
+                        ? candidateHasDropOff
+                        : interactionCount > bestInteractionCount ||
+                          (interactionCount == bestInteractionCount &&
+                           (oldestWaitSeconds > bestOldestWaitSeconds + 0.001f ||
+                            (Mathf.Abs(oldestWaitSeconds - bestOldestWaitSeconds) <= 0.001f &&
+                             candidateStopId < bestStopId)));
+                }
+
+                if (!shouldSelect)
+                {
+                    continue;
+                }
+
+                bestStopId = candidateStopId;
+                bestTravelSeconds = travelSeconds;
+                bestDropOffCount = dropOffCount;
+                bestInteractionCount = interactionCount;
+                bestOldestWaitSeconds = oldestWaitSeconds;
+            }
+
+            if (bestStopId < 1)
+            {
+                if (freeSeats > 0 &&
+                    passengerManager.TryGetNextScheduledOrigin(currentEpisodeTime, out int nextScheduledOriginStopId) &&
+                    FindStop(stops, nextScheduledOriginStopId) != null &&
+                    (!skipCurrentStop || stops.Count <= 1 || nextScheduledOriginStopId != currentStopId))
+                {
+                    bestStopId = nextScheduledOriginStopId;
+                    bestTravelSeconds = GetCandidateTravelSeconds(
+                        currentStopId,
+                        bestStopId,
+                        currentStop,
+                        FindStop(stops, bestStopId));
+                    scoreSummary.Append("no immediate interaction; fallback=next scheduled origin");
+                }
+                else
+                {
+                    bestStopId = GetNextSequentialStopId(currentStopId, stops);
+                    bestTravelSeconds = GetCandidateTravelSeconds(
+                        currentStopId,
+                        bestStopId,
+                        currentStop,
+                        FindStop(stops, bestStopId));
+                    scoreSummary.Append("no immediate interaction; fallback=vanilla sequential");
+                }
+            }
+
+            lastSelectedStopId = bestStopId;
+            LogSelectedStop(
+                "greedy-nearest-feasible",
+                bestStopId,
+                currentStopId,
+                currentEpisodeTime,
+                passengerManager,
+                bestTravelSeconds,
+                scoreSummary.ToString());
+            return bestStopId;
         }
 
         public int SelectAllStationRunnerStopId(
@@ -814,6 +962,58 @@ namespace DRT
             return Mathf.Clamp01(distance / Mathf.Max(1f, maxDistanceForObservation));
         }
 
+        private float GetCandidateTravelSeconds(int fromStopId, int toStopId, DRTStop origin, DRTStop destination)
+        {
+            if (fromStopId == toStopId)
+            {
+                return 0f;
+            }
+
+            if (busController != null &&
+                busController.TryGetTravelTimeSeconds(fromStopId, toStopId, out float matrixSeconds))
+            {
+                return Mathf.Max(0f, matrixSeconds);
+            }
+
+            if (origin == null || destination == null)
+            {
+                return float.MaxValue;
+            }
+
+            float distance = Vector3.Distance(origin.Position, destination.Position);
+            return 60f * distance / Mathf.Max(0.001f, networkDistanceUnitsPerMinute);
+        }
+
+        private static float GetOldestWaitingSecondsAtStop(
+            DRTPassengerManager passengerManager,
+            int stopId,
+            float currentEpisodeTime)
+        {
+            if (passengerManager == null || stopId < 1)
+            {
+                return 0f;
+            }
+
+            float oldestWaitSeconds = 0f;
+            var requests = passengerManager.Requests;
+            for (int i = 0; i < requests.Count; i++)
+            {
+                var request = requests[i];
+                if (request == null ||
+                    request.OriginStopId != stopId ||
+                    request.Status != DRTPassengerStatus.Waiting)
+                {
+                    continue;
+                }
+
+                oldestWaitSeconds = Mathf.Max(
+                    oldestWaitSeconds,
+                    request.GetWaitTime(currentEpisodeTime));
+            }
+
+            return oldestWaitSeconds;
+        }
+
         private void GetStopPassengerTimeFeatures(int stopId, float currentEpisodeTime, out float maxWaitSeconds, out float maxRideSeconds)
         {
             maxWaitSeconds = 0f;
@@ -888,6 +1088,10 @@ namespace DRT
                         behaviorParameters.BehaviorType = BehaviorType.InferenceOnly;
                         break;
                     case DRTNextStopPolicy.VanillaSequential:
+                        behaviorParameters.Model = null;
+                        behaviorParameters.BehaviorType = BehaviorType.HeuristicOnly;
+                        break;
+                    case DRTNextStopPolicy.GreedyNearestFeasible:
                         behaviorParameters.Model = null;
                         behaviorParameters.BehaviorType = BehaviorType.HeuristicOnly;
                         break;
